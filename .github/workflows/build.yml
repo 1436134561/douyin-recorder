@@ -1,0 +1,62 @@
+name: Build Windows
+
+on:
+  push:
+    branches: ['main']
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install frontend deps
+        run: pnpm install
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> ../target'
+
+      # 准备捆绑的嵌入式 Python + OpenCV（让检测功能开箱即用）
+      - name: Bundle embedded Python + OpenCV
+        shell: pwsh
+        run: |
+          $py = "python-runtime"
+          if (!(Test-Path $py)) { New-Item -ItemType Directory -Path $py }
+          # 下载嵌入式 Python 3.11 (amd64)
+          $url = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile py.zip
+          Expand-Archive -Force py.zip -DestinationPath $py
+          # 启用 site-packages（嵌入式默认关闭）
+          $cfg = Get-ChildItem $py -Filter "python3*._pth" | Select-Object -First 1
+          (Get-Content $cfg.FullName) -replace '^#import site', 'import site' | Set-Content $cfg.FullName
+          # 安装 pip
+          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile "$py/get-pip.py"
+          & "$py/python.exe" "$py/get-pip.py" --no-warn-script-location
+          # 安装 opencv + numpy
+          & "$py/python.exe" -m pip install --no-warn-script-location -r src-tauri/python/requirements.txt
+          # 拷贝检测器脚本
+          Copy-Item src-tauri/python/detector.py -Destination $py/detector.py -Force
+
+      - name: Build (tauri build -> nsis exe)
+        run: pnpm tauri build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: douyin-recorder-windows
+          path: src-tauri/target/release/bundle/nsis/*.exe

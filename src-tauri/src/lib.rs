@@ -1,0 +1,70 @@
+mod autostart;
+mod commands;
+mod config;
+mod detector;
+mod logic;
+mod recorder;
+mod state;
+mod transcode;
+mod tray;
+mod types;
+
+use tauri::Manager;
+use state::SharedState;
+
+/// 应用入口（Tauri v2：库形态，便于后续扩展移动端）
+pub fn run() {
+    let shared: SharedState = std::sync::Arc::new(std::sync::Mutex::new(state::AppState::new()));
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .manage(shared)
+        .on_window_event(|window, event| {
+            // 关闭主窗口仅隐藏，不退出（托盘常驻）
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .setup(|app| {
+            tray::setup_tray(app.handle())?;
+
+            // 若配置开机自启，则确保注册表/启动项已写入
+            {
+                let st = app.state::<SharedState>();
+                let cfg = st.lock().unwrap().config.clone();
+                if cfg.autostart {
+                    let _ = autostart::set_autostart(app.handle(), true);
+                }
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_config,
+            commands::save_config,
+            commands::list_rooms,
+            commands::import_rooms,
+            commands::remove_room,
+            commands::update_room,
+            commands::start_recording,
+            commands::start_monitor,
+            commands::stop_recording,
+            commands::stop_monitor,
+            commands::list_recordings,
+            commands::transcode_file,
+            commands::merge_videos,
+            commands::export_segments,
+            commands::set_autostart,
+            commands::get_autostart,
+            commands::show_main,
+            commands::hide_main,
+            commands::get_status,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
