@@ -52,6 +52,21 @@ jobs:
           # 拷贝检测器脚本
           Copy-Item src-tauri/python/detector.py -Destination $py/detector.py -Force
 
+      # 准备捆绑的 ffmpeg（录制/转码必需，开箱即用无需用户另行安装）
+      - name: Bundle ffmpeg (Windows)
+        shell: pwsh
+        run: |
+          $ff = "ffmpeg"
+          if (!(Test-Path $ff)) { New-Item -ItemType Directory -Path $ff }
+          # 下载 ffmpeg essentials 构建（含 libx264/mp3 等常用编码器）
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          Invoke-WebRequest -Uri $url -OutFile ff.zip
+          Expand-Archive -Force ff.zip -DestinationPath ff_tmp
+          # 取 bin/ffmpeg.exe 放到 ffmpeg/ffmpeg.exe（与 exe 同级的 resources 捆绑）
+          $bin = Get-ChildItem ff_tmp -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
+          Copy-Item $bin.FullName -Destination "$ff/ffmpeg.exe" -Force
+          Remove-Item ff.zip, ff_tmp -Recurse -Force
+
       - name: Build (tauri build -> nsis exe)
         run: pnpm tauri build
 

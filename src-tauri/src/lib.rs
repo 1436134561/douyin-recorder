@@ -2,12 +2,16 @@ mod autostart;
 mod commands;
 mod config;
 mod detector;
+mod ffmpeg;
 mod logic;
 mod recorder;
 mod state;
 mod transcode;
 mod tray;
 mod types;
+
+#[cfg(test)]
+mod tests;
 
 use tauri::Manager;
 use state::SharedState;

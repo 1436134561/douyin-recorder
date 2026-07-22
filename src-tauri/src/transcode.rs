@@ -3,9 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::ffmpeg::ffmpeg_executable;
+
 /// 运行 ffmpeg，吞掉 stderr（仅用于流水线，不向用户暴露日志）
 fn run_ffmpeg(args: &[String]) -> Result<()> {
-    let status = Command::new("ffmpeg")
+    let status = Command::new(ffmpeg_executable())
         .args(args)
         .stderr(std::process::Stdio::null())
         .status()

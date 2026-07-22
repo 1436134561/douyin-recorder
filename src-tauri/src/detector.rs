@@ -6,8 +6,9 @@ use std::thread;
 
 use anyhow::{anyhow, Result};
 use serde_json;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
+use crate::ffmpeg::ffmpeg_executable;
 use crate::logic::{Decision, SitStandLogic};
 use crate::recorder;
 use crate::state::AppState;
@@ -88,7 +89,7 @@ fn python_executable(cfg_py: &Option<String>) -> String {
 
 /// 启动检测器：ffmpeg 取低清低帧灰度流 → python stdin → JSON 事件行 → stdout
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_detector(
+pub fn spawn_detector<R: Runtime>(
     room_id: String,
     source: String,
     mode: String,
@@ -96,7 +97,7 @@ pub fn spawn_detector(
     sit_stop_seconds: u64,
     armed_start: bool,
     py_path: Option<String>,
-    app: AppHandle,
+    app: AppHandle<R>,
     state: Arc<Mutex<AppState>>,
 ) -> Result<DetectorHandle> {
     let script = detector_script_path();
@@ -128,7 +129,8 @@ pub fn spawn_detector(
         "-".into(),
     ]);
 
-    let mut ffmpeg = Command::new("ffmpeg")
+    let ffmpeg_bin = ffmpeg_executable();
+    let mut ffmpeg = Command::new(&ffmpeg_bin)
         .args(&ffmpeg_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::config::{AppConfig, RoomConfig, VIDEO_EXTS};
+use crate::ffmpeg::ffmpeg_executable;
 use crate::state::AppState;
 use crate::transcode;
 use crate::types::RecordingInfo;
@@ -60,10 +61,10 @@ fn resolve_stream_url(_room_id: &str) -> Option<String> {
 }
 
 /// 开始录制。spawn_detector=true 时按配置自动挂载坐立检测器（用于手动开始+检测停录）
-pub fn begin_recording(
+pub fn begin_recording<R: Runtime>(
     room_id: &str,
     spawn_detector: bool,
-    app: &AppHandle,
+    app: &AppHandle<R>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<()> {
     let (cfg, room) = {
@@ -125,7 +126,7 @@ fn start_ffmpeg(
             .ok_or_else(|| anyhow!("房间 {} 未配置直播流地址", room_id))?;
         let seg_time = cfg.segment_minutes.max(1) * 60;
         let out_tmpl = work.join("seg_%03d.flv");
-        Command::new("ffmpeg")
+        Command::new(ffmpeg_executable())
             .args([
                 "-y",
                 "-i",
@@ -150,7 +151,7 @@ fn start_ffmpeg(
     } else {
         let src = cfg.screen_source.clone().unwrap_or_else(|| "desktop".into());
         let out_file = work.join("rec.mp4");
-        Command::new("ffmpeg")
+        Command::new(ffmpeg_executable())
             .args([
                 "-y",
                 "-f",
@@ -206,9 +207,9 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
 }
 
 /// 停止录制并最终化：合并分片 → 转码为目标格式 → 清理临时目录 → 回传事件
-pub fn stop_and_finalize(
+pub fn stop_and_finalize<R: Runtime>(
     room_id: &str,
-    app: &AppHandle,
+    app: &AppHandle<R>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<RecordingInfo> {
     // 取出会话与检测器

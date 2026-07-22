@@ -27,6 +27,21 @@ export const useStore = defineStore('app', () => {
     toastTimer = window.setTimeout(() => (toast.value = null), 3200)
   }
 
+  // 统一包装异步调用：成功可给成功提示，失败显式弹出错误（避免「点了没反应」）
+  async function guarded(
+    label: string,
+    fn: () => Promise<unknown>,
+    okMsg?: string,
+  ) {
+    try {
+      await fn()
+      if (okMsg) notify('ok', okMsg)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : JSON.stringify(e)
+      notify('err', `${label}失败：${msg}`)
+    }
+  }
+
   async function init() {
     config.value = await api.getConfig()
     rooms.value = await api.listRooms()
@@ -64,67 +79,110 @@ export const useStore = defineStore('app', () => {
 
   async function saveConfig() {
     if (!config.value) return
-    await api.saveConfig(config.value)
-    notify('ok', '设置已保存')
+    await guarded(
+      '保存设置',
+      async () => {
+        await api.saveConfig(config.value!)
+      },
+      '设置已保存',
+    )
   }
 
   async function importRooms(text: string) {
-    rooms.value = await api.importRooms(text)
-    await refreshStatuses()
-    notify('ok', `已导入 ${rooms.value.length} 个房间`)
+    await guarded(
+      '导入房间',
+      async () => {
+        rooms.value = await api.importRooms(text)
+        await refreshStatuses()
+      },
+      `已导入 ${rooms.value.length} 个房间`,
+    )
   }
 
   async function removeRoom(id: string) {
-    await api.removeRoom(id)
-    rooms.value = rooms.value.filter((r) => r.id !== id)
-    delete statuses[id]
-    delete detections[id]
+    await guarded('删除房间', async () => {
+      await api.removeRoom(id)
+      rooms.value = rooms.value.filter((r) => r.id !== id)
+      delete statuses[id]
+      delete detections[id]
+    })
   }
 
   async function updateRoom(room: RoomConfig) {
-    await api.updateRoom(room)
-    const i = rooms.value.findIndex((r) => r.id === room.id)
-    if (i >= 0) rooms.value[i] = { ...room }
+    await guarded('更新房间', async () => {
+      await api.updateRoom(room)
+      const i = rooms.value.findIndex((r) => r.id === room.id)
+      if (i >= 0) rooms.value[i] = { ...room }
+    })
   }
 
   async function startRecording(id: string) {
-    await api.startRecording(id)
-    notify('ok', `开始录制 ${id}`)
-    await refreshStatuses()
+    await guarded(
+      '开始录制',
+      async () => {
+        await api.startRecording(id)
+        await refreshStatuses()
+      },
+      `开始录制 ${id}`,
+    )
   }
 
   async function startMonitor(id: string) {
-    await api.startMonitor(id)
-    notify('ok', `开始监控 ${id}`)
-    await refreshStatuses()
+    await guarded(
+      '开始监控',
+      async () => {
+        await api.startMonitor(id)
+        await refreshStatuses()
+      },
+      `开始监控 ${id}`,
+    )
   }
 
   async function stopRecording(id: string) {
-    await api.stopRecording(id)
-    await refreshStatuses()
+    await guarded('停止录制', async () => {
+      await api.stopRecording(id)
+      await refreshStatuses()
+    })
   }
 
   async function stopMonitor(id: string) {
-    await api.stopMonitor(id)
-    await refreshStatuses()
+    await guarded('停止监控', async () => {
+      await api.stopMonitor(id)
+      await refreshStatuses()
+    })
   }
 
   async function transcode(path: string, format: string) {
-    await api.transcodeFile(path, format)
-    await refreshRecordings()
-    notify('ok', `已转码为 ${format}`)
+    await guarded(
+      '转码',
+      async () => {
+        await api.transcodeFile(path, format)
+        await refreshRecordings()
+      },
+      `已转码为 ${format}`,
+    )
   }
 
   async function mergeSelected(paths: string[], name: string) {
-    await api.mergeVideos(paths, name)
-    await refreshRecordings()
-    notify('ok', '已合并视频')
+    await guarded(
+      '合并',
+      async () => {
+        await api.mergeVideos(paths, name)
+        await refreshRecordings()
+      },
+      '已合并视频',
+    )
   }
 
   async function exportSegments(path: string, segments: Segment[], name: string) {
-    await api.exportSegments(path, segments, name)
-    await refreshRecordings()
-    notify('ok', '已导出剪辑片段')
+    await guarded(
+      '导出剪辑',
+      async () => {
+        await api.exportSegments(path, segments, name)
+        await refreshRecordings()
+      },
+      '已导出剪辑片段',
+    )
   }
 
   function openEditor(file: RecordingInfo) {
@@ -137,9 +195,14 @@ export const useStore = defineStore('app', () => {
   }
 
   async function setAutostart(enable: boolean) {
-    await api.setAutostart(enable)
-    if (config.value) config.value.autostart = enable
-    notify('ok', enable ? '已开启开机自启' : '已关闭开机自启')
+    await guarded(
+      '设置开机自启',
+      async () => {
+        await api.setAutostart(enable)
+        if (config.value) config.value.autostart = enable
+      },
+      enable ? '已开启开机自启' : '已关闭开机自启',
+    )
   }
 
   async function fetchAutostart() {

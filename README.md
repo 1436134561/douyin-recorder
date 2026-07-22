@@ -41,10 +41,10 @@ Tauri(Rust)  ── 编排 ffmpeg ──► 录制 / 转码 / 合并
 ### 本地（Windows）一键出包
 
 ```bash
-# 安装依赖：Node 20+、Rust 稳定版、ffmpeg(已加入 PATH)、Python 3.11+
+# 安装依赖：Node 20+、Rust 稳定版、Python 3.11+（ffmpeg 由 CI 自动捆绑；本地开发可自备并加入 PATH）
 pnpm install
 pnpm tauri build
-# 产物：src-tauri/target/release/bundle/nsis/*.exe （安装包）
+# 产物：src-tauri/target/release/bundle/nsis/*.exe （安装包，已内置 ffmpeg + Python）
 ```
 
 ### 检测功能所需的 Python + OpenCV
@@ -54,10 +54,18 @@ pnpm tauri build
 - **发布版开箱即用**：CI 会把嵌入式 Python + OpenCV 打包进安装目录的 `python/`，
   程序优先使用该捆绑解释器，无需用户单独安装。
 
+### ffmpeg 已内置（开箱即用）
+
+录制 / 转码 / 合并依赖的 **ffmpeg 已随安装包捆绑**（安装目录的 `ffmpeg/ffmpeg.exe`），
+程序运行时优先使用该捆绑版本，未找到才回退系统 PATH。**用户无需单独安装 ffmpeg。**
+（`src-tauri/src/ffmpeg.rs` 负责路径解析；CI 在 `.github/workflows/build.yml` 下载 Windows ffmpeg essentials。）
+
+> 本地开发若未触发 CI 捆绑，请自行安装 ffmpeg 并加入 PATH，或修改 `tauri.conf.json` 的 `bundle.resources` 指向本地 `ffmpeg/`。
+
 ### GitHub Actions（自动出 exe）
 
-推送 `v*` 标签或手动触发 `.github/workflows/build.yml`，
-在 `windows-latest` 上自动构建并上传 NSIS 安装包作为 Artifact / Release。
+推送 `main` 分支、打 `v*` 标签，或手动触发 `.github/workflows/build.yml`，
+在 `windows-latest` 上自动构建（下载 Python+OpenCV+ffmpeg）并上传 NSIS 安装包作为 Artifact / Release。
 
 ## 使用说明
 
@@ -74,3 +82,11 @@ pnpm tauri build
 
 - 抖音直播流地址带签名/反爬，自动解析未内置；当前需在房间设置中手动粘贴流地址。
 - 坐立判定基于人脸占比 + 动作强度，极端机位可能需微调灵敏度。
+
+## 变更记录 / 修复
+
+- **修复「开始监控 / 立即录制 无反应」**：根因为 ① 安装包未捆绑 ffmpeg，干净 Windows 上
+  `ffmpeg` 启动失败导致后端命令返回 Err；② 前端 store 的异步方法未捕获错误，Promise 被静默丢弃。
+  已修复：将 ffmpeg 随包捆绑并运行时优先解析；前端所有异步操作加 `try/catch`，失败显式弹出
+  toast 提示（保证「点了就有反馈」）。新增 Rust 集成测试 `src-tauri/src/tests.rs` 覆盖
+  `begin_recording → 合并 → 转码` 全链路与 ffmpeg 缺失时的优雅报错。

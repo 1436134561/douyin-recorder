@@ -13,6 +13,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+# 仅测试时启用 tauri 的 test 模块（mock_builder），不影响发布构建
+test = ["tauri/test"]
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = { version = "2" }
