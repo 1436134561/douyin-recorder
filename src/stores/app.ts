@@ -210,6 +210,14 @@ export const useStore = defineStore('app', () => {
     if (config.value) config.value.autostart = enabled
   }
 
+  /** 解析抖音直播间 URL 为真实流地址（供前端预览） */
+  async function resolveRoomUrl(url: string) {
+    return await guarded(
+      '解析直播间',
+      () => api.resolveRoomUrl(url),
+    )
+  }
+
   return {
     config,
     rooms,
@@ -237,6 +245,7 @@ export const useStore = defineStore('app', () => {
     closeEditor,
     setAutostart,
     fetchAutostart,
+    resolveRoomUrl,
     notify,
   }
 })

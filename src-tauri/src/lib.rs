@@ -6,6 +6,7 @@ mod ffmpeg;
 mod logic;
 mod recorder;
 mod state;
+mod stream_resolver;
 mod transcode;
 mod tray;
 mod types;
@@ -68,6 +69,7 @@ pub fn run() {
             commands::show_main,
             commands::hide_main,
             commands::get_status,
+            commands::resolve_room_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

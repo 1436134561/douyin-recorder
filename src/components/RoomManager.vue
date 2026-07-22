@@ -69,7 +69,7 @@ async function saveEdit() {
         <input
           v-model="newId"
           class="input"
-          placeholder="输入单个房间号，如 123456789"
+          placeholder="房间号或直播间链接，如 123456789 或 https://live.douyin.com/xxx"
           @keyup.enter="addOne"
         />
         <button class="btn-primary" @click="addOne">
@@ -181,8 +181,12 @@ async function saveEdit() {
               <input v-model="draft.name" class="input" placeholder="可选" />
             </div>
             <div>
-              <label class="label">直播流地址 (flv/hls)</label>
-              <input v-model="draft.stream_url" class="input" placeholder="留空则回退屏幕捕获" />
+              <label class="label">直播流地址 / 直播间链接</label>
+              <input v-model="draft.stream_url" class="input" placeholder="抖音直播间链接、房间号或 flv/hls 地址（留空则回退屏幕捕获）" />
+              <p class="text-xs text-ink-400 mt-1">
+                支持粘贴 <code class="text-xs bg-ink-100 px-1 rounded">douyin.com</code> /
+                <code class="text-xs bg-ink-100 px-1 rounded">live.douyin.com</code> 链接或纯房间号，程序会自动解析为真实流地址
+              </p>
             </div>
             <div class="sm:col-span-2 flex justify-end gap-2">
               <button class="btn-ghost" @click="editingId = null">取消</button>

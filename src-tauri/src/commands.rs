@@ -67,14 +67,27 @@ pub fn update_room(room: RoomConfig, state: State<SharedState>) -> Result<(), St
 }
 
 /// 立即开始录制（若开启检测，则挂载坐立检测用于自动停录）
+/// 若房间配置的 stream_url 是抖音直播间网页 URL，会自动解析为真实 FLV 地址后再录制。
 #[tauri::command]
-pub fn start_recording(room_id: String, app: AppHandle, state: State<SharedState>) -> Result<(), String> {
+pub async fn start_recording(
+    room_id: String,
+    app: AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<(), String> {
+    // 如果 stream_url 是抖音 URL，先解析为真实流地址
+    resolve_room_stream_if_needed(&room_id, &state).await?;
     recorder::begin_recording(&room_id, true, &app, state.inner()).map_err(|e| e.to_string())
 }
 
 /// 开始监控：仅启动检测器，主播站立/有动作时自动开始，坐下无动作时自动停止
+/// 同样支持自动解析直播间 URL。
 #[tauri::command]
-pub fn start_monitor(room_id: String, app: AppHandle, state: State<SharedState>) -> Result<(), String> {
+pub async fn start_monitor(
+    room_id: String,
+    app: AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<(), String> {
+    resolve_room_stream_if_needed(&room_id, &state).await?;
     start_monitor_inner(&app, state.inner(), &room_id).map_err(|e| e.to_string())
 }
 
@@ -243,5 +256,69 @@ pub fn get_status(room_id: String, state: State<SharedState>) -> RoomStatus {
         monitoring: st.detectors.contains_key(&room_id),
         last_state: String::new(),
         last_motion: 0.0,
+    }
+}
+
+/// 若房间的 stream_url 是抖音直播间网页 URL（而非真实流地址），
+/// 自动解析为 FLV 流地址并回写配置。
+async fn resolve_room_stream_if_needed(
+    room_id: &str,
+    state: &State<'_, SharedState>,
+) -> Result<(), String> {
+    let maybe_url = {
+        let st = state.lock().unwrap();
+        st.config
+            .rooms
+            .iter()
+            .find(|r| r.id == room_id)
+            .and_then(|r| r.stream_url.clone())
+    };
+
+    let url = match maybe_url {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+
+    // 已经是流地址，无需解析
+    if crate::stream_resolver::is_stream_url(&url) {
+        return Ok(());
+    }
+
+    // 看起来像抖音 URL → 自动解析
+    if !crate::stream_resolver::looks_like_douyin_url(&url) {
+        return Ok(());
+    }
+
+    match crate::stream_resolver::resolve(&url).await {
+        Ok(resolved) => {
+            // 回写解析后的 FLV 地址到配置
+            let mut st = state.lock().unwrap();
+            if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
+                room.stream_url = Some(resolved.flv);
+            }
+            // 持久化（可选：不强制保存，避免频繁写盘）
+            let _ = crate::config::save_config(&st.config);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "自动解析直播流地址失败：{}。请确认主播正在直播，或手动填写 flv/hls 流地址。",
+            e
+        )),
+    }
+}
+
+/// 解析抖音直播间 URL 为真实流地址（供前端预览用）
+#[tauri::command]
+pub async fn resolve_room_url(url: String) -> Result<serde_json::Value, String> {
+    match crate::stream_resolver::resolve(&url).await {
+        Ok(resolved) => Ok(serde_json::json!({
+            "success": true,
+            "flv": resolved.flv,
+            "hls": resolved.hls,
+        })),
+        Err(e) => Ok(serde_json::json!({
+            "success": false,
+            "error": e.to_string(),
+        })),
     }
 }

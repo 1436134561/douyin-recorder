@@ -35,6 +35,9 @@ export const api = {
   hideMain: () => invoke<void>('hide_main'),
   getStatus: (roomId: string) =>
     invoke<RoomStatus>('get_status', { roomId }),
+  /** 解析抖音直播间 URL 为真实 FLV/HLS 流地址 */
+  resolveRoomUrl: (url: string) =>
+    invoke<{ success: boolean; flv?: string; hls?: string; error?: string }>('resolve_room_url', { url }),
   on: (event: string, cb: (payload: unknown) => void): Promise<UnlistenFn> =>
     listen(event, (e) => cb(e.payload)),
 }
