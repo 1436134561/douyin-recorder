@@ -60,7 +60,7 @@ pub fn looks_like_douyin_url(input: &str) -> bool {
 }
 
 /// 从用户输入提取 web_rid（房间 ID）
-fn extract_web_rid(input: &str) -> Result<String> {
+pub fn extract_web_rid(input: &str) -> Result<String> {
     let text = input.trim();
 
     // 纯数字房间号

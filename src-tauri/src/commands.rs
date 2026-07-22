@@ -29,9 +29,12 @@ pub fn list_rooms(state: State<SharedState>) -> Vec<RoomConfig> {
 }
 
 /// 批量导入房间号（支持换行/逗号/空格分隔的文本）
+///
+/// 智能识别：若输入是抖音直播间 URL，自动提取干净房间号作为 id，
+/// 原始 URL 存入 stream_url（后续录制时自动解析为真实流地址）。
 #[tauri::command]
 pub fn import_rooms(text: String, state: State<SharedState>) -> Result<Vec<RoomConfig>, String> {
-    let ids: Vec<String> = text
+    let raws: Vec<String> = text
         .split(|c| c == '\n' || c == ',' || c == ' ' || c == '\t' || c == '\r')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -39,12 +42,28 @@ pub fn import_rooms(text: String, state: State<SharedState>) -> Result<Vec<RoomC
 
     let mut st = state.lock().unwrap();
     let mut set: HashSet<String> = st.config.rooms.iter().map(|r| r.id.clone()).collect();
-    for id in ids {
+    for raw in raws {
+        // 判断是否为抖音 URL → 提取干净 ID + 存储 URL 到 stream_url
+        let (id, stream_url) =
+            if crate::stream_resolver::looks_like_douyin_url(&raw) {
+                match crate::stream_resolver::extract_web_rid(&raw) {
+                    Ok(clean_id) => (clean_id, Some(raw)),
+                    Err(_) => (raw.clone(), None), // 提取失败则原样存储
+                }
+            } else {
+                (raw.clone(), None) // 纯房间号 / 其他格式
+            };
+
         if set.contains(&id) {
             continue;
         }
         set.insert(id.clone());
-        st.config.rooms.push(RoomConfig::new(id));
+        st.config.rooms.push(RoomConfig {
+            id,
+            name: None,
+            stream_url,
+            enabled: true,
+        });
     }
     config::save_config(&st.config).map_err(|e| e.to_string())?;
     Ok(st.config.rooms.clone())
@@ -259,7 +278,7 @@ pub fn get_status(room_id: String, state: State<SharedState>) -> RoomStatus {
     }
 }
 
-/// 若房间的 stream_url 是抖音直播间网页 URL（而非真实流地址），
+/// 若房间的 stream_url（或 room_id 本身）是抖音直播间网页 URL，
 /// 自动解析为 FLV 流地址并回写配置。
 async fn resolve_room_stream_if_needed(
     room_id: &str,
@@ -274,24 +293,35 @@ async fn resolve_room_stream_if_needed(
             .and_then(|r| r.stream_url.clone())
     };
 
-    let url = match maybe_url {
-        Some(u) => u,
-        None => return Ok(()),
-    };
-
-    // 已经是流地址，无需解析
-    if crate::stream_resolver::is_stream_url(&url) {
+    // 已有流地址 → 检查是否需要解析
+    if let Some(ref url) = maybe_url {
+        // 已经是真实流地址，无需解析
+        if crate::stream_resolver::is_stream_url(url) {
+            return Ok(());
+        }
+        // stream_url 是抖音网页 URL → 解析它
+        if crate::stream_resolver::looks_like_douyin_url(url) {
+            return do_resolve_and_save(url, room_id, state).await;
+        }
         return Ok(());
     }
 
-    // 看起来像抖音 URL → 自动解析
-    if !crate::stream_resolver::looks_like_douyin_url(&url) {
-        return Ok(());
+    // stream_url 为空 → 检查 room_id 本身是否是抖音 URL（用户直接粘贴了链接作为 ID）
+    if crate::stream_resolver::looks_like_douyin_url(room_id) {
+        return do_resolve_and_save(room_id, room_id, state).await;
     }
 
-    match crate::stream_resolver::resolve(&url).await {
+    Ok(())
+}
+
+/// 执行解析并将结果回写到房间配置
+async fn do_resolve_and_save(
+    url_to_resolve: &str,
+    room_id: &str,
+    state: &State<'_, SharedState>,
+) -> Result<(), String> {
+    match crate::stream_resolver::resolve(url_to_resolve).await {
         Ok(resolved) => {
-            // 回写解析后的 FLV 地址和元数据到配置
             let mut st = state.lock().unwrap();
             if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
                 room.stream_url = Some(resolved.flv);
@@ -302,7 +332,6 @@ async fn resolve_room_stream_if_needed(
                     }
                 }
             }
-            // 持久化（可选：不强制保存，避免频繁写盘）
             let _ = crate::config::save_config(&st.config);
             Ok(())
         }

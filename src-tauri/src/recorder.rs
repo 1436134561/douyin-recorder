@@ -30,6 +30,14 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// 清洗房间 ID，只保留文件系统安全的字符（防止 URL 作为 ID 时路径非法）
+fn sanitize_room_id(room_id: &str) -> String {
+    room_id
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
+}
+
 /// 根据配置与房间决定录制模式（stream 需有流地址，否则回退 screen）
 fn decide_mode(cfg: &AppConfig, room: Option<&RoomConfig>) -> &'static str {
     let has_url = room.and_then(|r| r.stream_url.clone()).is_some();
@@ -115,7 +123,7 @@ fn start_ffmpeg(
     room: Option<&RoomConfig>,
 ) -> Result<RecordingSession> {
     std::fs::create_dir_all(&cfg.output_dir)?;
-    let work = cfg.output_dir.join(format!("._work_{}", room_id));
+    let work = cfg.output_dir.join(format!("._work_{}", sanitize_room_id(room_id)));
     std::fs::create_dir_all(&work)?;
 
     let mode = decide_mode(cfg, room);
