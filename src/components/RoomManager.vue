@@ -27,7 +27,24 @@ const stateClass: Record<string, string> = {
 async function addOne() {
   const id = newId.value.trim()
   if (!id) return
+  // 先添加房间（此时 name 为空）
   await store.importRooms(id)
+  // 如果输入的是抖音链接，尝试解析获取主播名并回填
+  const looksLikeUrl = id.includes('http') || id.includes('douyin.com') || id.includes('live.douyin')
+  if (looksLikeUrl) {
+    try {
+      const result = await store.resolveRoomUrl(id)
+      if (result && result.success && result.nickname) {
+        // 找到刚添加的房间，更新名称
+        const room = store.rooms.find((r: RoomConfig) => r.id === id || r.id === id.trim())
+        if (room) {
+          await store.updateRoom({ ...room, name: String(result.nickname), stream_url: result.flv || null })
+        }
+      }
+    } catch {
+      /* 解析失败不影响添加 */
+    }
+  }
   newId.value = ''
 }
 
@@ -110,10 +127,11 @@ async function saveEdit() {
               <Icon name="rooms" />
             </div>
             <div class="min-w-0">
-              <div class="font-semibold text-ink-800 truncate">{{ r.id }}</div>
+              <div class="font-semibold text-ink-800 truncate">{{ r.name || r.id }}</div>
               <div class="text-xs text-ink-400 truncate">
-                {{ r.name || '未命名' }}
-                <span v-if="r.stream_url" class="text-emerald-500">· 已配置流地址</span>
+                <span v-if="r.name && r.id !== r.name">{{ r.id }} · </span>
+                <span v-if="r.stream_url" class="text-emerald-500">已配置流地址</span>
+                <span v-else class="text-amber-500">待解析</span>
               </div>
             </div>
           </div>

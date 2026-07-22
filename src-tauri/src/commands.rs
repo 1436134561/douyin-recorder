@@ -291,10 +291,16 @@ async fn resolve_room_stream_if_needed(
 
     match crate::stream_resolver::resolve(&url).await {
         Ok(resolved) => {
-            // 回写解析后的 FLV 地址到配置
+            // 回写解析后的 FLV 地址和元数据到配置
             let mut st = state.lock().unwrap();
             if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
                 room.stream_url = Some(resolved.flv);
+                // 自动填充房间名（优先使用主播昵称）
+                if room.name.is_none() || room.name.as_deref() == Some("") {
+                    if let Some(ref meta) = resolved.meta {
+                        room.name = Some(meta.nickname.clone());
+                    }
+                }
             }
             // 持久化（可选：不强制保存，避免频繁写盘）
             let _ = crate::config::save_config(&st.config);
@@ -307,15 +313,23 @@ async fn resolve_room_stream_if_needed(
     }
 }
 
-/// 解析抖音直播间 URL 为真实流地址（供前端预览用）
+/// 解析抖音直播间 URL 为真实流地址（供前端预览用，含元数据）
 #[tauri::command]
 pub async fn resolve_room_url(url: String) -> Result<serde_json::Value, String> {
     match crate::stream_resolver::resolve(&url).await {
-        Ok(resolved) => Ok(serde_json::json!({
-            "success": true,
-            "flv": resolved.flv,
-            "hls": resolved.hls,
-        })),
+        Ok(resolved) => {
+            let mut obj = serde_json::json!({
+                "success": true,
+                "flv": resolved.flv,
+                "hls": resolved.hls,
+            });
+            // 附加元数据（主播名、房间标题）
+            if let Some(meta) = resolved.meta {
+                obj["nickname"] = serde_json::json!(meta.nickname);
+                obj["title"] = serde_json::json!(meta.title);
+            }
+            Ok(obj)
+        }
         Err(e) => Ok(serde_json::json!({
             "success": false,
             "error": e.to_string(),

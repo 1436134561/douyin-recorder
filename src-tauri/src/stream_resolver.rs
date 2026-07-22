@@ -16,13 +16,24 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// 解析结果
+/// 解析结果（含流地址 + 房间元数据）
 #[derive(Debug, Clone)]
 pub struct ResolvedStream {
     /// 最佳 FLV 流地址（优先原画 OR4，其次 HD）
     pub flv: String,
     /// HLS (m3u8) 地址（可选）
     pub hls: Option<String>,
+    /// 房间元数据（主播昵称、房间标题等）
+    pub meta: Option<RoomMeta>,
+}
+
+/// 从直播间提取的元数据
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoomMeta {
+    /// 主播昵称
+    pub nickname: String,
+    /// 房间标题
+    pub title: String,
 }
 
 /// 画质优先级（从高到低）
@@ -58,14 +69,8 @@ fn extract_web_rid(input: &str) -> Result<String> {
     }
 
     // 从 URL 中提取
-    // 短链接 v.douyin.com/xxx → 需要跟随重定向（此处先尝试正则提取 room_id）
-    // 直播间 live.douyin.com/{rid}
-    // 关注页 /follow/live/{rid}
-    // 参数 ?anchor_id=xxx 或 room_id=xxx 或 web_rid=xxx
-
     let patterns = [
         r"live\.douyin\.com/([^/?#]+)",
-        r"/live/(\d+)",
         r"/follow/live/(\d+)",
         r"room_id[=:](\d+)",
         r"anchor_id[=:](\d+)",
@@ -102,7 +107,7 @@ fn extract_web_rid(input: &str) -> Result<String> {
     ))
 }
 
-/// HTTP 客户端（带 cookie jar + 浏览器 UA）
+/// HTTP 客户端（带 cookie jar + 浏览器 UA + 完整请求头）
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(
@@ -115,18 +120,9 @@ fn http_client() -> reqwest::Client {
 }
 
 /// 初始化 ttwid cookie（抖音反爬要求）
-async fn init_cookies(client: &reqwest::Client) -> Result<()> {
-    // 先访问一次 live.douyin.com 触发 cookie
-    match client.get("https://live.douyin.com/").send().await {
-        Ok(resp) => {
-            if resp.headers().get("set-cookie").is_some() {
-                return Ok(()); // 已有 cookie
-            }
-        }
-        Err(_) => {}
-    }
-
-    // 备选：POST ttwid 接口注册
+/// 返回 ttwid 字符串用于后续请求
+async fn obtain_ttwid(client: &reqwest::Client) -> Result<String> {
+    // 方案 1：POST ttwid 注册接口获取 cookie
     let payload = serde_json::json!({
         "region": "cn",
         "aid": 1768,
@@ -137,20 +133,82 @@ async fn init_cookies(client: &reqwest::Client) -> Result<()> {
         "union": true,
     });
 
-    client
+    let resp = client
         .post("https://ttwid.bytedance.com/ttwid/union/register/")
         .header("Content-Type", "application/json")
+        .header("Origin", "https://www.douyin.com")
+        .header("Referer", "https://www.douyin.com/")
         .body(payload.to_string())
         .send()
         .await
-        .ok(); // 失败不阻塞
+        .map_err(|e| anyhow!("请求 ttwid 注册接口失败: {}", e))?;
 
-    Ok(())
+    // 从 Set-Cookie 或响应体中提取 ttwid
+    if let Some(cookie_hdr) = resp.headers().get("set-cookie") {
+        let cookie_str = cookie_hdr.to_str().unwrap_or("");
+        if let Some(ttwid) = extract_cookie_value(cookie_str, "ttwid") {
+            return Ok(ttwid);
+        }
+    }
+
+    // 尝试从响应体 JSON 中提取
+    let body = resp.text().await.unwrap_or_default();
+    if let Ok(json) = serde_json::from_str::<Value>(&body) {
+        if let Some(token) = json.get("data").and_then(|d| d.get("token")).and_then(|t| t.as_str()) {
+            // 构造 ttwid cookie 值格式
+            return Ok(format!("1{}", token));
+        }
+    }
+
+    // 方案 2：访问 live.douyin.com 触发 cookie
+    let resp2 = client
+        .get("https://live.douyin.com/")
+        .header("Accept", "text/html,application/xhtml+xml")
+        .send()
+        .await;
+
+    if let Ok(r) = resp2 {
+        if let Some(cookie_hdr) = r.headers().get("set-cookie") {
+            let cookie_str = cookie_hdr.to_str().unwrap_or("");
+            if let Some(ttwid) = extract_cookie_value(cookie_str, "ttwid") {
+                return Ok(ttwid);
+            }
+        }
+    }
+
+    // 返回空字符串表示未获取到（后续请求可能仍能工作）
+    Ok(String::new())
+}
+
+/// 从 Set-Cookie header 字符串中提取指定 cookie 的值
+fn extract_cookie_value(cookie_header: &str, name: &str) -> Option<String> {
+    for part in cookie_header.split(';') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix(name) {
+            if let Some(val) = rest.strip_prefix('=') {
+                return Some(val.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 从 Webcast API 响应中提取房间元数据
+fn extract_meta_from_api(data: &Value) -> Option<RoomMeta> {
+    let data_obj = data.get("data")?;
+    let user = data_obj.get("user")?;
+    let nickname = user.get("nickname")?.as_str()?.to_string();
+    let title = data_obj.get("room")?.get("title")?.as_str()?.to_string();
+    Some(RoomMeta { nickname, title })
 }
 
 /// 调用 Webcast API 获取流地址（首选方案）
-async fn fetch_webcast_api(web_rid: &str, client: &reqwest::Client) -> Result<HashMap<String, String>> {
-    init_cookies(client).await.ok();
+async fn fetch_webcast_api(
+    web_rid: &str,
+    client: &reqwest::Client,
+) -> Result<(HashMap<String, String>, Option<RoomMeta>)> {
+    // 获取 ttwid cookie
+    let ttwid = obtain_ttwid(client).await.ok();
 
     let params = [
         ("aid", "6383"),
@@ -174,24 +232,51 @@ async fn fetch_webcast_api(web_rid: &str, client: &reqwest::Client) -> Result<Ha
             .join("&")
     );
 
-    let resp = client
+    let mut req_builder = client
         .get(&url)
         .header("Referer", "https://live.douyin.com/")
+        .header("Accept", "application/json, text/plain, */*");
+
+    // 附上 ttwid cookie（如果有）
+    if let Some(ref tid) = ttwid {
+        if !tid.is_empty() {
+            req_builder = req_builder.header("Cookie", format!("ttwid={}", tid));
+        }
+    }
+
+    let resp = req_builder
         .send()
         .await
         .map_err(|e| anyhow!("请求 Webcast API 失败: {}", e))?;
 
+    let status = resp.status();
     let body = resp.text().await.map_err(|e| anyhow!("读取响应失败: {}", e))?;
-    let data: Value = serde_json::from_str(&body).map_err(|e| anyhow!("解析 JSON 失败: {}", e))?;
+
+    // 先尝试解析为 JSON
+    let data: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            // 非 JSON 响应（可能是 HTML 重定向或错误页）
+            return Err(anyhow!(
+                "API 返回非 JSON 数据（HTTP {}），可能需要更新解析逻辑。响应前 200 字节: {}",
+                status,
+                &body[..body.len().min(200)]
+            ));
+        }
+    };
 
     // 检查 API 返回状态
-    if data.get("status_code").and_then(|v| v.as_i64()) != Some(0) {
+    let status_code = data.get("status_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if status_code != 0 {
         let msg = data
             .get("status_msg")
             .and_then(|v| v.as_str())
             .unwrap_or("未知错误");
-        return Err(anyhow!("API 返回错误: {} (主播可能未在直播)", msg));
+        return Err(anyhow!("API 返回错误({}): {} (主播可能未在直播)", status_code, msg));
     }
+
+    // 提取元数据
+    let meta = extract_meta_from_api(&data);
 
     // 递归查找流地址
     let mut flv_urls = HashMap::new();
@@ -214,8 +299,100 @@ async fn fetch_webcast_api(web_rid: &str, client: &reqwest::Client) -> Result<Ha
             "API 未返回流地址（主播可能未在直播或已下播）"
         ))
     } else {
-        Ok(result)
+        Ok((result, meta))
     }
+}
+
+/// 方案 2：从页面 HTML 的 RENDER_DATA 提取流地址和元数据
+async fn fetch_page_render_data(
+    web_rid: &str,
+    client: &reqwest::Client,
+) -> Result<(HashMap<String, String>, Option<RoomMeta>)> {
+    // 构造直播间页面 URL
+    let page_url = format!("https://live.douyin.com/{}", web_rid);
+
+    let resp = client
+        .get(&page_url)
+        .header("Referer", "https://www.douyin.com/")
+        .header("Accept", "text/html,application/xhtml+xml")
+        .send()
+        .await
+        .map_err(|e| anyhow!("请求直播间页面失败: {}", e))?;
+
+    let html = resp.text().await.map_err(|e| anyhow!("读取页面失败: {}", e))?;
+
+    // 提取 RENDER_DATA JSON
+    let render_data_str = extract_render_data(&html)?;
+
+    let data: Value = serde_json::from_str(&render_data_str)
+        .map_err(|e| anyhow!("解析 RENDER_DATA JSON 失败: {}", e))?;
+
+    // 提取元数据
+    let meta = extract_meta_from_render_data(&data);
+
+    // 查找流地址
+    let mut flv_urls = HashMap::new();
+    let mut hls_urls = HashMap::new();
+    recursive_find_streams(&data, &mut flv_urls, &mut hls_urls);
+
+    let mut result = HashMap::new();
+    for (k, v) in flv_urls {
+        result.insert(format!("flv:{}", k), v);
+    }
+    for (k, v) in hls_urls {
+        result.insert(format!("hls:{}", k), v);
+    }
+
+    if result.is_empty() {
+        Err(anyhow!("页面 RENDER_DATA 中未找到流地址"))
+    } else {
+        Ok((result, meta))
+    }
+}
+
+/// 从 HTML 中提取 RENDER_DATA 内容
+fn extract_render_data(html: &str) -> Result<String> {
+    // 匹配 <script id="RENDER_DATA" type="application/json">...</script>
+    let re = Regex::new(r#"<script\s+id="RENDER_DATA"\s+type="application/json">([^<]+)</script>"#)
+        .map_err(|e| anyhow!("编译 RENDER_DATA 正则失败: {}", e))?;
+
+    if let Some(cap) = re.captures(html) {
+        let raw = cap
+            .get(1)
+            .ok_or_else(|| anyhow!("RENDER_DATA 内容为空"))?
+            .as_str();
+
+        // RENDER_DATA 是 URL 编码的 JSON
+        match urlencoding::decode(raw) {
+            Ok(decoded) => Ok(decoded.into_owned()),
+            Err(_) => Ok(raw.to_string()),
+        }
+    } else {
+        Err(anyhow!("页面中未找到 RENDER_DATA（可能被反爬拦截）"))
+    }
+}
+
+/// 从 RENDER_DATA JSON 中提取房间元数据
+fn extract_meta_from_render_data(data: &Value) -> Option<RoomMeta> {
+    // RENDER_DATA 结构: { "app": { "initialState": { "roomStore": { "roomInfo": { ... } }, "userStore": ... } } }
+    let initial_state = data
+        .get("app")?
+        .get("initialState")?;
+
+    // 尝试从 roomStore 获取
+    let room_info = initial_state
+        .get("roomStore")?
+        .get("roomInfo")?
+        .get("room")?;
+
+    let nickname = room_info
+        .get("anchor")?
+        .get("nickName")?
+        .as_str()?
+        .to_string();
+    let title = room_info.get("title")?.as_str()?.to_string();
+
+    Some(RoomMeta { nickname, title })
 }
 
 /// 递归查找 JSON 中的流地址字段
@@ -265,7 +442,7 @@ fn recursive_find_streams(
                 }
             }
 
-            // 递归遍历其他字段（已知流地址字段已在上面处理过）
+            // 递归遍历其他字段
             for value in map.values() {
                 recursive_find_streams(value, flv_out, hls_out);
             }
@@ -312,13 +489,13 @@ fn best_hls(urls: &HashMap<String, String>) -> Option<String> {
     None
 }
 
-/// 公开接口：解析用户输入为真实流地址
+/// 公开接口：解析用户输入为真实流地址 + 元数据
 ///
 /// # Arguments
 /// * `input` - 抖音直播间 URL、短链接或纯房间号
 ///
 /// # Returns
-/// `ResolvedStream` 包含最佳 FLV 和可选 HLS 地址
+/// `ResolvedStream` 包含最佳 FLV、可选 HLS 地址和房间元数据
 pub async fn resolve(input: &str) -> Result<ResolvedStream> {
     let input = input.trim();
     if input.is_empty() {
@@ -330,6 +507,7 @@ pub async fn resolve(input: &str) -> Result<ResolvedStream> {
         return Ok(ResolvedStream {
             flv: input.to_string(),
             hls: None,
+            meta: None,
         });
     }
 
@@ -337,23 +515,33 @@ pub async fn resolve(input: &str) -> Result<ResolvedStream> {
     let client = http_client();
 
     // 方案 1: Webcast API
-    if let Ok(urls) = fetch_webcast_api(&web_rid, &client).await {
+    if let Ok((urls, meta)) = fetch_webcast_api(&web_rid, &client).await {
         if let Some(flv) = best_flv(&urls) {
             return Ok(ResolvedStream {
                 flv,
                 hls: best_hls(&urls),
+                meta,
             });
         }
     }
 
     // 方案 2: 页面 HTML RENDER_DATA（备选）
-    // TODO: 若 Webcast API 失败可在此添加页面抓取逻辑
+    if let Ok((urls, meta)) = fetch_page_render_data(&web_rid, &client).await {
+        if let Some(flv) = best_flv(&urls) {
+            return Ok(ResolvedStream {
+                flv,
+                hls: best_hls(&urls),
+                meta,
+            });
+        }
+    }
 
     Err(anyhow!(
         "无法获取直播流地址。请确认：\n\
          1. 主播正在直播\n\
          2. 房间号/链接正确\n\
-         3. 网络连接正常"
+         3. 网络连接正常\n\
+         \n提示：部分直播间可能因地域限制或风控策略暂时无法解析"
     ))
 }
 
@@ -453,5 +641,25 @@ mod tests {
             hls.get("OR4"),
             Some(&"https://pull-xxx.or4/index.m3u8?t=1".to_string())
         );
+    }
+
+    #[test]
+    fn test_extract_cookie_value() {
+        let header = "ttwid=1%7Cabc123_xyz; Path=/; Domain=.bytedance.com; Max-Age=31536000";
+        assert_eq!(
+            extract_cookie_value(header, "ttwid"),
+            Some("1%7Cabc123_xyz".to_string())
+        );
+        assert_eq!(extract_cookie_value(header, "other"), None);
+    }
+
+    #[test]
+    fn test_extract_render_data() {
+        let html = r#"<!DOCTYPE html><html><body>
+<script id="RENDER_DATA" type="application/json">%7B%22app%22%3A%7B%7D%7D</script>
+</body></html>"#;
+        let result = extract_render_data(html);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "{\"app\":{}}");
     }
 }
