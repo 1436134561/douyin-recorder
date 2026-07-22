@@ -6,6 +6,9 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -75,3 +78,19 @@ jobs:
         with:
           name: douyin-recorder-windows
           path: src-tauri/target/release/bundle/nsis/*.exe
+
+      # 发布为 GitHub Release（直接下载 exe，无需登录/解压）
+      - name: Publish Release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXE=$(ls src-tauri/target/release/bundle/nsis/*.exe | head -1)
+          cp "$EXE" douyin-recorder-setup.exe
+          # 删除旧 latest 发布与标签，重建为滚动最新版
+          gh release delete latest --yes 2>/dev/null || true
+          git push --delete origin latest 2>/dev/null || true
+          gh release create latest \
+            --title "抖音直播录屏 (最新自动构建)" \
+            --notes "Windows 安装程序（内置 ffmpeg，开箱即用）。支持直接粘贴抖音直播间链接自动解析录制。" \
+            douyin-recorder-setup.exe
