@@ -3,13 +3,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use crate::ffmpeg::ffmpeg_executable;
 
 /// 运行 ffmpeg，吞掉 stderr（仅用于流水线，不向用户暴露日志）
 fn run_ffmpeg(args: &[String]) -> Result<()> {
-    let status = Command::new(ffmpeg_executable())
-        .args(args)
-        .stderr(std::process::Stdio::null())
+    let mut cmd = Command::new(ffmpeg_executable());
+    cmd.args(args)
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    { cmd.creation_flags(0x08000000); }
+    let status = cmd
         .status()
         .map_err(|e| anyhow!("找不到 ffmpeg（{}），请确认已安装并加入 PATH", e))?;
     if !status.success() {

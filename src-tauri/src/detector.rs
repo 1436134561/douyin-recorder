@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{anyhow, Result};
 use serde_json;
 use tauri::{AppHandle, Emitter, Runtime};
@@ -73,11 +76,13 @@ fn python_executable(cfg_py: &Option<String>) -> String {
         }
     }
     for name in ["python", "python3", "py"] {
-        if Command::new(name)
-            .arg("--version")
+        let mut cmd = Command::new(name);
+        cmd.arg("--version")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        { cmd.creation_flags(0x08000000); }
+        if cmd.status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
@@ -130,10 +135,13 @@ pub fn spawn_detector<R: Runtime>(
     ]);
 
     let ffmpeg_bin = ffmpeg_executable();
-    let mut ffmpeg = Command::new(&ffmpeg_bin)
-        .args(&ffmpeg_args)
+    let mut ffmpeg_cmd = Command::new(&ffmpeg_bin);
+    ffmpeg_cmd.args(&ffmpeg_args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    { ffmpeg_cmd.creation_flags(0x08000000); }
+    let mut ffmpeg = ffmpeg_cmd
         .spawn()
         .map_err(|e| anyhow!("启动 ffmpeg 检测流失败: {}", e))?;
 
@@ -142,8 +150,8 @@ pub fn spawn_detector<R: Runtime>(
         .take()
         .ok_or_else(|| anyhow!("无法获取 ffmpeg stdout"))?;
 
-    let mut python = Command::new(&py)
-        .arg(&script)
+    let mut python_cmd = Command::new(&py);
+    python_cmd.arg(&script)
         .arg("--width")
         .arg("320")
         .arg("--height")
@@ -152,7 +160,10 @@ pub fn spawn_detector<R: Runtime>(
         .arg(sensitivity.to_string())
         .stdin(Stdio::from(fout))
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    { python_cmd.creation_flags(0x08000000); }
+    let mut python = python_cmd
         .spawn()
         .map_err(|e| anyhow!("启动检测器失败: {}", e))?;
 

@@ -1,5 +1,8 @@
 use std::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 /// 解析可用的 ffmpeg 可执行文件路径。
 ///
 /// 优先级：
@@ -25,13 +28,15 @@ pub fn ffmpeg_executable() -> String {
             }
         }
     }
-    // 探测 PATH 上的 ffmpeg 是否可用
+    // 探测 PATH 上的 ffmpeg 是否可用（隐藏窗口，不闪黑框）
     for name in ["ffmpeg", "ffmpeg.exe", "avconv"] {
-        if Command::new(name)
-            .arg("-version")
+        let mut cmd = Command::new(name);
+        cmd.arg("-version")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        { cmd.creation_flags(0x08000000); }
+        if cmd.status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
