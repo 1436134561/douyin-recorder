@@ -47,6 +47,8 @@ pub fn merge_segments(segments: &[PathBuf], output: &Path) -> Result<()> {
         list_path.to_string_lossy().into(),
         "-c".into(),
         "copy".into(),
+        "-movflags".into(),
+        "+faststart".into(),
         output.to_string_lossy().into(),
     ];
     let r = run_ffmpeg(&args);
@@ -54,7 +56,10 @@ pub fn merge_segments(segments: &[PathBuf], output: &Path) -> Result<()> {
     r
 }
 
-/// 转码到目标格式。mp4/mkv/mov 走流拷贝；webm 重新编码为 vp9/opus
+/// 转码到目标格式
+///
+/// mp4/mkv/mov 走 `-c copy` 流拷贝，但会加 `-movflags +faststart`
+/// 以保证 WebView2 / 浏览器能立即解码（避免 moov atom 位置问题导致黑屏）。
 pub fn transcode(input: &Path, output: &Path, format: &str) -> Result<()> {
     let mut args = vec!["-y".into(), "-i".into(), input.to_string_lossy().into()];
     match format {
@@ -69,6 +74,11 @@ pub fn transcode(input: &Path, output: &Path, format: &str) -> Result<()> {
         _ => {
             args.push("-c".into());
             args.push("copy".into());
+            // mp4/mov 需要 faststart 以保证浏览器/WebView2 可即时播放
+            if format == "mp4" || format == "mov" {
+                args.push("-movflags".into());
+                args.push("+faststart".into());
+            }
         }
     }
     args.push(output.to_string_lossy().into());

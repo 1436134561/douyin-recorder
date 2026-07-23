@@ -34,7 +34,7 @@ fn now_ts() -> i64 {
 }
 
 /// 清洗房间 ID/文件名，只保留文件系统安全的字符
-fn sanitize_room_id(room_id: &str) -> String {
+pub fn sanitize_room_id(room_id: &str) -> String {
     room_id
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')

@@ -323,13 +323,27 @@ async fn do_resolve_and_save(
     match crate::stream_resolver::resolve(url_to_resolve).await {
         Ok(resolved) => {
             let mut st = state.lock().unwrap();
+            // 如果房间名是空的，且解析拿到了主播昵称 → 填充，并尝试重命名已有文件
             if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
                 room.stream_url = Some(resolved.flv);
-                // 自动填充房间名（优先使用主播昵称）
+                let old_name = room.name.clone();
                 if room.name.is_none() || room.name.as_deref() == Some("") {
                     if let Some(ref meta) = resolved.meta {
-                        room.name = Some(meta.nickname.clone());
+                        if !meta.nickname.is_empty() {
+                            room.name = Some(meta.nickname.clone());
+                        }
                     }
+                }
+                // 名称更新了 → 重命名 output_dir 里已有以房间 ID 开头的录制文件
+                if old_name.is_none() && room.name.is_some() {
+                    let new_name = room.name.clone().unwrap();
+                    let _ = rename_room_recordings(
+                        &st.config.output_dir,
+                        room_id,
+                        &new_name,
+                        st.config.auto_mp4,
+                        &st.config.output_format,
+                    );
                 }
             }
             let _ = crate::config::save_config(&st.config);
@@ -463,5 +477,53 @@ pub fn cleanup_pending_recording(work_dir: String, state: State<SharedState>) ->
         return Err("工作目录不存在".into());
     }
     std::fs::remove_dir_all(&target).map_err(|e| format!("清理失败: {}", e))?;
+    Ok(())
+}
+
+/// 当房间名被填充后，重命名 output_dir 里以 room_id 开头的录制文件
+/// 旧文件名：`<room_id>_<timestamp>.<ext>` → 新文件名：`<anchor_name>_<timestamp>.<ext>`
+fn rename_room_recordings(
+    output_dir: &std::path::Path,
+    room_id: &str,
+    new_name: &str,
+    auto_mp4: bool,
+    output_format: &str,
+) -> Result<(), String> {
+    use crate::recorder::sanitize_room_id;
+    let safe_room = sanitize_room_id(room_id);
+    let safe_name = sanitize_room_id(new_name);
+    if safe_room == safe_name || safe_room.is_empty() || safe_name.is_empty() {
+        return Ok(());
+    }
+    let effective_ext = if auto_mp4 { "mp4" } else { output_format };
+
+    let entries = std::fs::read_dir(output_dir).map_err(|e| format!("read_dir: {}", e))?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let stem = match p.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // 匹配 "<room_id>_<timestamp>" 形式
+        let prefix = format!("{}_", safe_room);
+        if !stem.starts_with(&prefix) {
+            continue;
+        }
+        let suffix = &stem[prefix.len()..];
+        let new_stem = format!("{}_{}", safe_name, suffix);
+        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+        let final_ext = if ext.is_empty() { effective_ext } else { ext };
+        let new_path = p.with_file_name(format!("{}.{}", new_stem, final_ext));
+        // 避免覆盖已存在的目标
+        if new_path.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&p, &new_path) {
+            eprintln!("重命名 {:?} -> {:?} 失败: {}", p, new_path, e);
+        }
+    }
     Ok(())
 }

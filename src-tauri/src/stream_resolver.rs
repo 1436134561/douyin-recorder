@@ -193,13 +193,59 @@ fn extract_cookie_value(cookie_header: &str, name: &str) -> Option<String> {
     None
 }
 
-/// 从 Webcast API 响应中提取房间元数据
+/// 从 Webcast API 响应中提取房间元数据（多重路径宽松解析，任一命中即返回）
 fn extract_meta_from_api(data: &Value) -> Option<RoomMeta> {
     let data_obj = data.get("data")?;
-    let user = data_obj.get("user")?;
-    let nickname = user.get("nickname")?.as_str()?.to_string();
-    let title = data_obj.get("room")?.get("title")?.as_str()?.to_string();
-    Some(RoomMeta { nickname, title })
+
+    // 尝试多个路径获取主播昵称
+    let nickname = data_obj
+        .get("user")
+        .and_then(|u| u.get("nickname"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            data_obj
+                .get("anchor")
+                .and_then(|a| a.get("nickname"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            data_obj
+                .get("room")
+                .and_then(|r| r.get("owner"))
+                .and_then(|o| o.get("nickname"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            data_obj
+                .get("room")
+                .and_then(|r| r.get("anchor"))
+                .and_then(|a| a.get("nickname"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string());
+
+    // 尝试多个路径获取房间标题
+    let title = data_obj
+        .get("room")
+        .and_then(|r| r.get("title"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            data_obj
+                .get("room")
+                .and_then(|r| r.get("dynamic_content"))
+                .and_then(|d| d.get("title"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string());
+
+    // 任一字段获取到即返回
+    match (nickname, title) {
+        (Some(n), t) if !n.is_empty() => Some(RoomMeta {
+            nickname: n,
+            title: t.unwrap_or_default(),
+        }),
+        _ => None,
+    }
 }
 
 /// 调用 Webcast API 获取流地址（首选方案）
