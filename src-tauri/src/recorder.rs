@@ -33,7 +33,7 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
-/// 清洗房间 ID，只保留文件系统安全的字符（防止 URL 作为 ID 时路径非法）
+/// 清洗房间 ID/文件名，只保留文件系统安全的字符
 fn sanitize_room_id(room_id: &str) -> String {
     room_id
         .chars()
@@ -41,8 +41,17 @@ fn sanitize_room_id(room_id: &str) -> String {
         .collect()
 }
 
-/// 在 Windows 上隐藏子进程的控制台窗口（防止 ffmpeg 弹出黑框）
-/// CREATE_NO_WINDOW = 0x08000000
+/// 格式化时间戳为 `2026-07-23_18-52-34`（本地时间，使用 chrono）
+fn fmt_ts(ts: i64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d_%H-%M-%S").to_string())
+        .unwrap_or_else(|| format!("{}", ts))
+}
+
+/// 在 Windows 上隐藏子进程的控制台窗口
 fn spawn_hidden(cmd: &mut Command) -> Result<std::process::Child> {
     #[cfg(windows)]
     let child = cmd
@@ -56,7 +65,7 @@ fn spawn_hidden(cmd: &mut Command) -> Result<std::process::Child> {
     Ok(child)
 }
 
-/// 根据配置与房间决定录制模式（stream 需有流地址，否则回退 screen）
+/// 根据配置与房间决定录制模式
 fn decide_mode(cfg: &AppConfig, room: Option<&RoomConfig>) -> &'static str {
     let has_url = room.and_then(|r| r.stream_url.clone()).is_some();
     let want_stream = cfg.capture_mode != "screen";
@@ -80,13 +89,11 @@ pub fn resolve_source(room_id: &str, cfg: &AppConfig, room: Option<&RoomConfig>)
     (source, mode.to_string())
 }
 
-/// 抖音直播流地址解析（反爬/签名处理）。当前需用户在房间设置中手动粘贴流地址，
-/// 后续可在此接入解析器。
 fn resolve_stream_url(_room_id: &str) -> Option<String> {
     None
 }
 
-/// 开始录制。spawn_detector=true 时按配置自动挂载坐立检测器（用于手动开始+检测停录）
+/// 开始录制
 pub fn begin_recording<R: Runtime>(
     room_id: &str,
     spawn_detector: bool,
@@ -100,7 +107,7 @@ pub fn begin_recording<R: Runtime>(
         (cfg, room)
     };
     if state.lock().unwrap().recordings.contains_key(room_id) {
-        return Ok(()); // 已在录制
+        return Ok(());
     }
 
     let session = start_ffmpeg(room_id, &cfg, room.as_ref())?;
@@ -205,8 +212,7 @@ fn start_ffmpeg(
         spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 屏幕录制启动失败: {}", e))?
     };
 
-    // 启动后短暂等待，验证 ffmpeg 是否异常退出（仅非 0 退出码才算失败，
-    // 本地文件源播完会正常 exit 0，不误判）
+    // 启动后短暂等待，验证 ffmpeg 是否异常退出（仅非 0 退出码视为失败）
     std::thread::sleep(std::time::Duration::from_millis(600));
     if let Ok(Some(status)) = child.try_wait() {
         if !status.success() {
@@ -229,18 +235,17 @@ fn start_ffmpeg(
     })
 }
 
-/// 收集录制产生的分片文件（按名称排序）
+/// 收集有效分片文件
 fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if session.mode == "stream" {
         if let Ok(entries) = std::fs::read_dir(&session.work_dir) {
             for e in entries.flatten() {
                 let p = e.path();
-                // 只收集非空分片文件（过滤掉 ffmpeg 创建的空壳）
                 if p.extension().map(|x| x == "flv").unwrap_or(false) {
                     if let Ok(meta) = std::fs::metadata(&p) {
-                        if meta.len() > 1024 {
-                            // 大于 1KB 视为有效分片
+                        // 阈值 10KB：排除 ffmpeg 创建的空壳文件，保留正常录制的分片
+                        if meta.len() > 10_240 {
                             files.push(p);
                         }
                     }
@@ -252,7 +257,7 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
         let f = session.work_dir.join("rec.mp4");
         if f.exists() {
             if let Ok(meta) = std::fs::metadata(&f) {
-                if meta.len() > 1024 {
+                if meta.len() > 10_240 {
                     files.push(f);
                 }
             }
@@ -261,13 +266,27 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
     files
 }
 
-/// 停止录制并最终化：合并分片 → 转码为目标格式 → 清理临时目录 → 回传事件
+/// 计算最终输出文件名（主播名_时间戳.扩展名）
+fn build_final_name(cfg: &AppConfig, room_id: &str, ts: i64) -> String {
+    let anchor_name = cfg
+        .rooms
+        .iter()
+        .find(|r| r.id == room_id)
+        .and_then(|r| r.name.clone())
+        .filter(|s| !s.is_empty())
+        .map(|s| sanitize_room_id(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| sanitize_room_id(room_id));
+    let effective_fmt = if cfg.auto_mp4 { "mp4" } else { &cfg.output_format };
+    format!("{}_{}.{}", anchor_name, fmt_ts(ts), effective_fmt)
+}
+
+/// 停止录制并最终化
 pub fn stop_and_finalize<R: Runtime>(
     room_id: &str,
     app: &AppHandle<R>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<RecordingInfo> {
-    // 取出会话与检测器
     let (session, det) = {
         let mut st = state.lock().unwrap();
         let s = st.recordings.remove(room_id);
@@ -294,16 +313,15 @@ pub fn stop_and_finalize<R: Runtime>(
     let files = gather_segments(&session);
     let cfg = state.lock().unwrap().config.clone();
     let merged = session.work_dir.join("merged.flv");
-    let final_name = format!("{}_{}.{}", sanitize_room_id(room_id), now_ts(), cfg.output_format);
+    let ts = now_ts();
+    let final_name = build_final_name(&cfg, room_id, ts);
     let final_path = cfg.output_dir.join(&final_name);
 
     if files.is_empty() {
-        // 清理工作目录
-        let _ = std::fs::remove_dir_all(&session.work_dir);
         return Err(anyhow!(
-            "本次录制没有产生有效的视频文件。\n\
+            "本次录制没有产生有效的视频文件（阈值 > 10KB）。\n\
              可能原因：\n\
-             ① 录制时间太短（<2 秒）\n\
+             ① 录制时间太短（< 3 秒）\n\
              ② 直播流地址无效或主播已下播\n\
              请确认直播间正在直播后再尝试录制。"
         ));
@@ -312,18 +330,32 @@ pub fn stop_and_finalize<R: Runtime>(
     if files.len() > 1 {
         transcode::merge_segments(&files, &merged)?;
     } else if let Some(f) = files.first() {
-        let _ = std::fs::copy(f, &merged);
+        if let Err(e) = std::fs::copy(f, &merged) {
+            return Err(anyhow!("复制分片失败: {}", e));
+        }
     }
 
-    if merged.exists() && merged.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
-        transcode::transcode(&merged, &final_path, &cfg.output_format)?;
-    } else if let Some(f) = files.first() {
-        transcode::transcode(f, &final_path, &cfg.output_format)?;
-    } else {
-        let _ = std::fs::remove_dir_all(&session.work_dir);
-        return Err(anyhow!("合并转码失败，无有效视频数据"));
+    if !merged.exists() || merged.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        // 保留 work_dir 以便恢复
+        let work = session.work_dir.clone();
+        return Err(anyhow!(
+            "合并后无有效数据。原始分片保留在: {}",
+            work.display()
+        ));
     }
 
+    // 转码：成功才删 work_dir；失败保留供用户恢复
+    let effective_fmt = if cfg.auto_mp4 { "mp4" } else { &cfg.output_format };
+    if let Err(e) = transcode::transcode(&merged, &final_path, effective_fmt) {
+        let work = session.work_dir.clone();
+        return Err(anyhow!(
+            "转码失败: {}。原始分片保留在: {}",
+            e,
+            work.display()
+        ));
+    }
+
+    // 转码成功，清理 work_dir
     let _ = std::fs::remove_dir_all(&session.work_dir);
 
     let info = RecordingInfo {
@@ -332,8 +364,8 @@ pub fn stop_and_finalize<R: Runtime>(
         path: final_path.to_string_lossy().into(),
         size_bytes: std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0),
         duration_sec: 0.0,
-        format: cfg.output_format.clone(),
-        created_at: now_ts(),
+        format: effective_fmt.to_string(),
+        created_at: ts,
     };
     let _ = app.emit("recording_stopped", serde_json::json!(&info));
     Ok(info)
@@ -345,6 +377,7 @@ pub fn list_recordings_in(dir: &Path) -> Vec<RecordingInfo> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             let p = e.path();
+            // 跳过 work_dir 临时目录
             if p
                 .file_name()
                 .map(|n| n.to_string_lossy().starts_with("._work"))

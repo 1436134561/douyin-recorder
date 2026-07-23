@@ -8,12 +8,14 @@ import type {
   DetectionEvent,
   RoomStatus,
   Segment,
+  PendingRecording,
 } from '../lib/types'
 
 export const useStore = defineStore('app', () => {
   const config = ref<AppConfig | null>(null)
   const rooms = ref<RoomConfig[]>([])
   const recordings = ref<RecordingInfo[]>([])
+  const pendingRecordings = ref<PendingRecording[]>([])
   const statuses = reactive<Record<string, RoomStatus>>({})
   const detections = reactive<Record<string, DetectionEvent>>({})
   const editorOpen = ref(false)
@@ -46,12 +48,14 @@ export const useStore = defineStore('app', () => {
     config.value = await api.getConfig()
     rooms.value = await api.listRooms()
     await refreshRecordings()
+    await refreshPending()
     await refreshStatuses()
     api.on('recording_started', () => {
       refreshStatuses()
     })
     api.on('recording_stopped', () => {
       refreshRecordings()
+      refreshPending()
       refreshStatuses()
       notify('ok', '录制已完成并合并转码')
     })
@@ -63,6 +67,14 @@ export const useStore = defineStore('app', () => {
 
   async function refreshRecordings() {
     recordings.value = await api.listRecordings()
+  }
+
+  async function refreshPending() {
+    try {
+      pendingRecordings.value = await api.listPendingRecordings()
+    } catch {
+      pendingRecordings.value = []
+    }
   }
 
   async function refreshStatuses() {
@@ -141,6 +153,8 @@ export const useStore = defineStore('app', () => {
   async function stopRecording(id: string) {
     await guarded('停止录制', async () => {
       await api.stopRecording(id)
+      await refreshRecordings()
+      await refreshPending()
       await refreshStatuses()
     })
   }
@@ -219,10 +233,27 @@ export const useStore = defineStore('app', () => {
     return result as Record<string, unknown> | null
   }
 
+  /** 删除已完成录制 */
+  async function deleteRecording(path: string) {
+    await guarded('删除录像', async () => {
+      await api.deleteRecording(path)
+      await refreshRecordings()
+    })
+  }
+
+  /** 清理「等待中」录制的工作目录 */
+  async function cleanupPending(workDir: string) {
+    await guarded('清理残留', async () => {
+      await api.cleanupPendingRecording(workDir)
+      await refreshPending()
+    })
+  }
+
   return {
     config,
     rooms,
     recordings,
+    pendingRecordings,
     statuses,
     detections,
     editorOpen,
@@ -230,6 +261,7 @@ export const useStore = defineStore('app', () => {
     toast,
     init,
     refreshRecordings,
+    refreshPending,
     refreshStatuses,
     saveConfig,
     importRooms,
@@ -247,6 +279,8 @@ export const useStore = defineStore('app', () => {
     setAutostart,
     fetchAutostart,
     resolveRoomUrl,
+    deleteRecording,
+    cleanupPending,
     notify,
   }
 })

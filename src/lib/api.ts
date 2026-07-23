@@ -7,6 +7,7 @@ import type {
   DetectionEvent,
   RoomStatus,
   Segment,
+  PendingRecording,
 } from './types'
 
 export const api = {
@@ -38,6 +39,13 @@ export const api = {
   /** 解析抖音直播间 URL 为真实 FLV/HLS 流地址 */
   resolveRoomUrl: (url: string) =>
     invoke<{ success: boolean; flv?: string; hls?: string; error?: string }>('resolve_room_url', { url }),
+  /** 删除一个已完成的录制文件 */
+  deleteRecording: (path: string) => invoke<void>('delete_recording', { path }),
+  /** 列出「等待中」的录制（转码失败残留） */
+  listPendingRecordings: () => invoke<PendingRecording[]>('list_pending_recordings'),
+  /** 清理「等待中」录制的工作目录 */
+  cleanupPendingRecording: (workDir: string) =>
+    invoke<void>('cleanup_pending_recording', { workDir }),
   on: (event: string, cb: (payload: unknown) => void): Promise<UnlistenFn> =>
     listen(event, (e) => cb(e.payload)),
 }

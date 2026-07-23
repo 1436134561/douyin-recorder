@@ -30,6 +30,9 @@ pub struct AppConfig {
     pub output_dir: PathBuf,
     /// 录制完成后转出的最终格式：mp4/mkv/mov/webm
     pub output_format: String,
+    /// 是否始终转码为 MP4（无视 output_format 设置）
+    #[serde(default = "default_true")]
+    pub auto_mp4: bool,
     /// flv 分片时长（分钟）
     pub segment_minutes: u64,
     /// 是否启用坐立检测控制录制
@@ -50,6 +53,8 @@ pub struct AppConfig {
     pub rooms: Vec<RoomConfig>,
 }
 
+fn default_true() -> bool { true }
+
 impl Default for AppConfig {
     fn default() -> Self {
         let out = dirs::video_dir()
@@ -58,6 +63,7 @@ impl Default for AppConfig {
         AppConfig {
             output_dir: out,
             output_format: "mp4".into(),
+            auto_mp4: true,
             segment_minutes: 10,
             detect_enabled: true,
             sensitivity: 1.0,

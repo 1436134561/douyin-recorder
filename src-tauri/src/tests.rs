@@ -66,6 +66,7 @@ mod tests {
             config: AppConfig {
                 output_dir: out_dir,
                 output_format: "mp4".into(),
+                auto_mp4: true,
                 segment_minutes: 1,
                 detect_enabled: false,
                 sensitivity: 1.0,

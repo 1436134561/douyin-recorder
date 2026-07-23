@@ -35,9 +35,16 @@ onMounted(() => {
           </div>
           <div>
             <label class="label">默认输出格式</label>
-            <select v-model="store.config.output_format" class="input">
+            <select
+              v-model="store.config.output_format"
+              class="input"
+              :disabled="store.config.auto_mp4"
+            >
               <option v-for="f in formats" :key="f" :value="f">{{ f.toUpperCase() }}</option>
             </select>
+            <p class="mt-1 text-xs text-ink-400" v-if="store.config.auto_mp4">
+              始终转 MP4 已开启，已忽略此设置
+            </p>
           </div>
           <div>
             <label class="label">分片时长（分钟）</label>
@@ -49,6 +56,27 @@ onMounted(() => {
             />
           </div>
         </div>
+
+        <div class="mt-5 pt-5 border-t border-ink-100 flex items-center justify-between">
+          <div>
+            <h3 class="font-medium text-ink-800">始终转码为 MP4</h3>
+            <p class="text-xs text-ink-400 mt-1">
+              开启后，无论选择何种默认格式，最终输出都是 MP4（兼容性最好）。
+              关闭则使用上方选择的格式。
+            </p>
+          </div>
+          <button
+            class="relative w-11 h-6 rounded-full transition-colors duration-200"
+            :class="store.config.auto_mp4 ? 'bg-brand-600' : 'bg-ink-200'"
+            @click="store.config.auto_mp4 = !store.config.auto_mp4"
+          >
+            <span
+              class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200"
+              :class="store.config.auto_mp4 ? 'translate-x-5' : ''"
+            ></span>
+          </button>
+        </div>
+
         <p class="mt-3 text-xs text-ink-400">
           录制按分片保存 flv，结束后自动合并并转出所选格式。
         </p>

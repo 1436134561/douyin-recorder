@@ -365,3 +365,103 @@ pub async fn resolve_room_url(url: String) -> Result<serde_json::Value, String> 
         })),
     }
 }
+
+/// 删除一个已完成的录制文件
+#[tauri::command]
+pub fn delete_recording(path: String, state: State<SharedState>) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    // 安全检查：文件必须在 output_dir 下
+    let cfg = state.lock().unwrap().config.clone();
+    let out_dir = std::fs::canonicalize(&cfg.output_dir).unwrap_or_else(|_| cfg.output_dir.clone());
+    let target = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if !target.starts_with(&out_dir) {
+        return Err(format!(
+            "安全限制：只能删除 output_dir({}) 下的录制文件",
+            out_dir.display()
+        ));
+    }
+    std::fs::remove_file(&target).map_err(|e| format!("删除失败: {}", e))?;
+    Ok(())
+}
+
+/// 列出「等待中」的录制（转码失败残留的 work_dir，可手动恢复/清理）
+#[tauri::command]
+pub fn list_pending_recordings(state: State<SharedState>) -> Vec<crate::types::PendingRecording> {
+    let cfg = state.lock().unwrap().config.clone();
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&cfg.output_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = match p.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => continue,
+            };
+            if !name.starts_with("._work_") {
+                continue;
+            }
+            // 扫描 work_dir 内的 flv/mp4 分片
+            let mut segments = Vec::new();
+            let mut total: u64 = 0;
+            let mut earliest: i64 = i64::MAX;
+            if let Ok(subs) = std::fs::read_dir(&p) {
+                for s in subs.flatten() {
+                    let sp = s.path();
+                    let ext_ok = sp
+                        .extension()
+                        .map(|x| x == "flv" || x == "mp4")
+                        .unwrap_or(false);
+                    if !ext_ok {
+                        continue;
+                    }
+                    if let Ok(m) = s.metadata() {
+                        if m.len() > 10_240 {
+                            segments.push(sp.clone());
+                            total += m.len();
+                            if let Ok(modified) = m.modified() {
+                                if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                                    let ts = d.as_secs() as i64;
+                                    if ts < earliest {
+                                        earliest = ts;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if segments.is_empty() {
+                continue;
+            }
+            // 从工作目录名解析房间 ID（去掉前缀 `._work_`）
+            let room_id = name.trim_start_matches("._work_").to_string();
+            out.push(crate::types::PendingRecording {
+                work_dir: p.to_string_lossy().into(),
+                segment_count: segments.len() as u32,
+                total_bytes: total,
+                room_id,
+                earliest_ts: if earliest == i64::MAX { 0 } else { earliest },
+            });
+        }
+    }
+    out
+}
+
+/// 清理「等待中」录制的工作目录（删除残留分片）
+#[tauri::command]
+pub fn cleanup_pending_recording(work_dir: String, state: State<SharedState>) -> Result<(), String> {
+    let p = std::path::Path::new(&work_dir);
+    let cfg = state.lock().unwrap().config.clone();
+    let out_dir = std::fs::canonicalize(&cfg.output_dir).unwrap_or_else(|_| cfg.output_dir.clone());
+    let target = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if !target.starts_with(&out_dir) {
+        return Err("安全限制：只能清理 output_dir 下的残留".into());
+    }
+    if !target.exists() {
+        return Err("工作目录不存在".into());
+    }
+    std::fs::remove_dir_all(&target).map_err(|e| format!("清理失败: {}", e))?;
+    Ok(())
+}

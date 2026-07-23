@@ -39,3 +39,18 @@ pub struct RoomStatus {
     pub last_state: String,
     pub last_motion: f32,
 }
+
+/// 「等待中」的录制（转码失败 / 残留的工作目录，可手动恢复或清理）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PendingRecording {
+    /// 工作目录路径（含原始分片）
+    pub work_dir: String,
+    /// 该目录下有效分片数
+    pub segment_count: u32,
+    /// 总字节数
+    pub total_bytes: u64,
+    /// 房间 ID（从工作目录名解析）
+    pub room_id: String,
+    /// 最早分片修改时间（Unix 秒）
+    pub earliest_ts: i64,
+}
