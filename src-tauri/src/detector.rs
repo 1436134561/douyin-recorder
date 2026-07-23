@@ -204,10 +204,11 @@ pub fn spawn_detector<R: Runtime>(
             if should_start || should_stop {
                 let recording = state2.lock().unwrap().recordings.contains_key(&room2);
                 if should_start && !recording {
-                    // 自动开始录制（不再新开检测器，避免递归）
+                    // 自动开始录制（不新开检测器，沿用当前 detector）
                     let _ = recorder::begin_recording(&room2, false, &app2, &state2);
                 } else if should_stop && recording {
-                    let _ = recorder::stop_and_finalize(&room2, &app2, &state2);
+                    // 循环模式下保留 detector：坐下停录后，下次站起来重新录
+                    let _ = recorder::stop_and_finalize(&room2, armed_start, &app2, &state2);
                     logic.reset();
                 }
             }

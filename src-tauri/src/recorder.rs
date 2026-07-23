@@ -282,16 +282,23 @@ fn build_final_name(cfg: &AppConfig, room_id: &str, ts: i64) -> String {
 }
 
 /// 停止录制并最终化
+///
+/// `keep_detector`：
+/// - `false`：用户主动停止 → 同时销毁检测器（传统模式）
+/// - `true`：检测器触发停止 → 保留检测器，等待下次循环触发（坐立检测循环模式）
 pub fn stop_and_finalize<R: Runtime>(
     room_id: &str,
+    keep_detector: bool,
     app: &AppHandle<R>,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<RecordingInfo> {
     let (session, det) = {
         let mut st = state.lock().unwrap();
         let s = st.recordings.remove(room_id);
-        let d = st.detectors.remove(room_id);
-        st.logic.remove(room_id);
+        let d = if keep_detector { None } else { st.detectors.remove(room_id) };
+        if !keep_detector {
+            st.logic.remove(room_id);
+        }
         (s, d)
     };
     if let Some(mut d) = det {
@@ -357,6 +364,13 @@ pub fn stop_and_finalize<R: Runtime>(
 
     // 转码成功，清理 work_dir
     let _ = std::fs::remove_dir_all(&session.work_dir);
+
+    // 循环模式：重置状态机，让检测器可以再次触发 Start
+    if keep_detector {
+        if let Some(logic) = state.lock().unwrap().logic.get_mut(room_id) {
+            logic.reset();
+        }
+    }
 
     let info = RecordingInfo {
         id: final_name.clone(),

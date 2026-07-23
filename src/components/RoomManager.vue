@@ -55,7 +55,7 @@ async function saveEdit() {
       <div>
         <h1 class="text-2xl font-semibold text-ink-800">房间管理</h1>
         <p class="text-sm text-ink-400 mt-1">
-          添加抖音房间号，支持批量导入与逐个开始录制 / 监控。
+          「开始监控」会自动跟随主播状态：起立录制、坐下 5 秒后停录、再次起立继续录。
         </p>
       </div>
       <button class="btn-ghost" @click="showBatch = !showBatch">
@@ -135,10 +135,18 @@ async function saveEdit() {
               REC
             </span>
             <span
-              v-else-if="store.statuses[r.id]?.monitoring"
+              v-else-if="store.statuses[r.id]?.monitoring && !store.statuses[r.id]?.recording"
               class="badge bg-brand-50 text-brand-600"
+              title="监控中：坐着待命，主播站起来会立即自动录制"
             >
-              <Icon name="eye" /> 监控
+              <Icon name="eye" /> 监控（待主播起立）
+            </span>
+            <span
+              v-else-if="store.statuses[r.id]?.monitoring"
+              class="badge bg-amber-50 text-amber-600"
+              title="监控中：主播坐下，5秒后自动停止录制"
+            >
+              <Icon name="hourglass" /> 监控（坐下待停）
             </span>
           </div>
         </div>

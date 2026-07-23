@@ -7,6 +7,7 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import LibraryView from './components/LibraryView.vue'
 import PreviewEditor from './components/PreviewEditor.vue'
 import Icon from './components/Icon.vue'
+import ConfirmDialog from './components/ConfirmDialog.vue'
 import { useStore } from './stores/app'
 
 const store = useStore()
@@ -43,6 +44,9 @@ onMounted(() => store.init())
       :file="store.editorFile"
       @close="store.closeEditor"
     />
+
+    <!-- 全局确认对话框 -->
+    <ConfirmDialog />
 
     <!-- Toast -->
     <Transition name="fade">

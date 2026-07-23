@@ -26,6 +26,28 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// 检查 ffmpeg 是否支持 H.264 编码（决定是否能跑录屏流水线测试）
+    fn ffmpeg_has_libx264() -> bool {
+        // 用 ffmpeg 询问 libx264 帮助：若不存在会输出 "Codec 'libx264' not found" 或类似
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-h", "encoder=libx264"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match out {
+            Ok(o) => {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                // 存在标志：列出 "Encoder libx264" 段
+                // 不存在标志："not found" / "Unknown encoder"
+                let has_help = s.contains("Encoder libx264");
+                let denied = s.contains("not found") || s.contains("Unknown encoder");
+                has_help && !denied
+            }
+            Err(_) => false,
+        }
+    }
+
     /// 选一个能编码 H.264 的 ffmpeg 用于生成测试样本（本机 /usr/bin/ffmpeg 含 libx264，
     /// 静态版 /usr/local/bin/ffmpeg 不含；Windows CI 上回退到 PATH 的 ffmpeg）
     fn sample_ffmpeg() -> String {
@@ -98,6 +120,10 @@ mod tests {
             eprintln!("ffmpeg 不可用，跳过录制流水线测试");
             return;
         }
+        if !ffmpeg_has_libx264() {
+            eprintln!("ffmpeg 不含 libx264，跳过录制流水线测试（H.264 重新编码必需）");
+            return;
+        }
         let base = std::env::temp_dir().join("douyin_recorder_test");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -120,7 +146,7 @@ mod tests {
             .expect("begin_recording 应成功");
         // 等待分片生成（样本 2s，segment 60s → 产生单段）
         std::thread::sleep(std::time::Duration::from_millis(3000));
-        let info = recorder::stop_and_finalize("testroom", &handle, &shared)
+        let info = recorder::stop_and_finalize("testroom", false, &handle, &shared)
             .expect("stop_and_finalize 应成功");
         assert!(Path::new(&info.path).exists(), "最终文件应存在: {}", info.path);
         let size = std::fs::metadata(&info.path).unwrap().len();

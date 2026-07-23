@@ -39,6 +39,9 @@ pub fn run() {
         .setup(|app| {
             tray::setup_tray(app.handle())?;
 
+            // 启动时强制显示主窗口（即使 visible=false 也能稳定出现）
+            commands::show_window(app.handle());
+
             // 若配置开机自启，则确保注册表/启动项已写入
             {
                 let st = app.state::<SharedState>();

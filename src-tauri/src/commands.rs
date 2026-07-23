@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, State, Window};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::autostart;
 use crate::config::{self, AppConfig, RoomConfig};
@@ -150,21 +150,18 @@ pub fn stop_recording(
     app: AppHandle,
     state: State<SharedState>,
 ) -> Result<RecordingInfo, String> {
-    recorder::stop_and_finalize(&room_id, &app, state.inner()).map_err(|e| e.to_string())
+    recorder::stop_and_finalize(&room_id, false, &app, state.inner()).map_err(|e| e.to_string())
 }
 
-/// 停止监控（同时停止检测与录制）
+/// 停止监控（销毁检测器；若正在录制，则一并停止）
 #[tauri::command]
 pub fn stop_monitor(room_id: String, state: State<SharedState>) -> Result<(), String> {
     let mut st = state.lock().unwrap();
     if let Some(mut h) = st.detectors.remove(&room_id) {
         h.stop();
     }
-    if st.recordings.contains_key(&room_id) {
-        drop(st);
-        // 若正在录制，交给 stop_and_finalize 完成收尾
-        // 注意：此处无 app handle，交由前端直接调用 stop_recording
-    }
+    st.logic.remove(&room_id);
+    // 录制由前端另行调用 stop_recording 收尾（keep_detector=false 会自动清理）
     Ok(())
 }
 
@@ -255,15 +252,25 @@ pub fn get_autostart(app: AppHandle) -> bool {
     autostart::is_autostart_enabled(&app)
 }
 
-#[tauri::command]
-pub fn show_main(window: Window) {
-    let _ = window.show();
-    let _ = window.set_focus();
+/// 强制显示主窗口（从任何状态恢复：hidden + minimized → 稳定可见 + 获焦）
+pub fn show_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
 }
 
 #[tauri::command]
-pub fn hide_main(window: Window) {
-    let _ = window.hide();
+pub fn show_main(app: AppHandle) {
+    show_window(&app);
+}
+
+#[tauri::command]
+pub fn hide_main(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
 }
 
 #[tauri::command]

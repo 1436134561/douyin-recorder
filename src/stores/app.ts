@@ -23,6 +23,52 @@ export const useStore = defineStore('app', () => {
   const toast = ref<{ type: 'ok' | 'err'; msg: string } | null>(null)
   let toastTimer: number | undefined
 
+  // 全局确认对话框状态（替代浏览器原生 confirm）
+  const confirmDialog = ref<{
+    open: boolean
+    title: string
+    message: string
+    confirmText: string
+    cancelText: string
+    danger: boolean
+    resolve: ((ok: boolean) => void) | null
+  }>({
+    open: false,
+    title: '',
+    message: '',
+    confirmText: '确定',
+    cancelText: '取消',
+    danger: false,
+    resolve: null,
+  })
+
+  function confirm(opts: {
+    title: string
+    message: string
+    confirmText?: string
+    cancelText?: string
+    danger?: boolean
+  }): Promise<boolean> {
+    return new Promise((resolve) => {
+      confirmDialog.value = {
+        open: true,
+        title: opts.title,
+        message: opts.message,
+        confirmText: opts.confirmText ?? '确定',
+        cancelText: opts.cancelText ?? '取消',
+        danger: opts.danger ?? false,
+        resolve,
+      }
+    })
+  }
+
+  function closeConfirm(ok: boolean) {
+    const r = confirmDialog.value.resolve
+    confirmDialog.value.open = false
+    confirmDialog.value.resolve = null
+    if (r) r(ok)
+  }
+
   function notify(type: 'ok' | 'err', msg: string) {
     toast.value = { type, msg }
     if (toastTimer) clearTimeout(toastTimer)
@@ -259,6 +305,7 @@ export const useStore = defineStore('app', () => {
     editorOpen,
     editorFile,
     toast,
+    confirmDialog,
     init,
     refreshRecordings,
     refreshPending,
@@ -281,6 +328,8 @@ export const useStore = defineStore('app', () => {
     resolveRoomUrl,
     deleteRecording,
     cleanupPending,
+    confirm,
+    closeConfirm,
     notify,
   }
 })

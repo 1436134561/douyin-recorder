@@ -58,8 +58,9 @@ pub fn merge_segments(segments: &[PathBuf], output: &Path) -> Result<()> {
 
 /// 转码到目标格式
 ///
-/// mp4/mkv/mov 走 `-c copy` 流拷贝，但会加 `-movflags +faststart`
-/// 以保证 WebView2 / 浏览器能立即解码（避免 moov atom 位置问题导致黑屏）。
+/// mp4/mkv/mov 输出 H.264 Baseline + yuv420p + AAC + faststart：
+/// 极速编码（ultrafast preset），且 100% WebView2 / 浏览器兼容，
+/// 解决抖音原始流编码（可能含 High Profile / AnnexB 等）在浏览器黑屏的问题。
 pub fn transcode(input: &Path, output: &Path, format: &str) -> Result<()> {
     let mut args = vec!["-y".into(), "-i".into(), input.to_string_lossy().into()];
     match format {
@@ -72,9 +73,22 @@ pub fn transcode(input: &Path, output: &Path, format: &str) -> Result<()> {
             args.push("0".into());
         }
         _ => {
-            args.push("-c".into());
-            args.push("copy".into());
-            // mp4/mov 需要 faststart 以保证浏览器/WebView2 可即时播放
+            // 重新编码为 Web 通用兼容的 mp4/mkv/mov 容器
+            args.push("-c:v".into());
+            args.push("libx264".into());
+            args.push("-profile:v".into());
+            args.push("baseline".into());
+            args.push("-level".into());
+            args.push("3.0".into());
+            args.push("-pix_fmt".into());
+            args.push("yuv420p".into());
+            args.push("-preset".into());
+            args.push("ultrafast".into());
+            args.push("-c:a".into());
+            args.push("aac".into());
+            args.push("-b:a".into());
+            args.push("128k".into());
+            // mp4/mov 需要 faststart 保证浏览器/WebView2 立即解码
             if format == "mp4" || format == "mov" {
                 args.push("-movflags".into());
                 args.push("+faststart".into());

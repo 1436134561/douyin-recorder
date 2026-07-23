@@ -16,6 +16,8 @@ const duration = ref(0)
 const current = ref<Segment>({ start: 0, end: 0 })
 const segments = ref<Segment[]>([])
 const dragging = ref<null | 'start' | 'end'>(null)
+const loadError = ref<string>('')
+const isLoading = ref(false)
 
 const fileUrl = computed(() => {
   try {
@@ -38,6 +40,28 @@ function onMeta() {
   if (current.value.end === 0 && duration.value > 0) {
     current.value = { start: 0, end: duration.value }
   }
+  loadError.value = ''
+}
+
+function onVideoError() {
+  isLoading.value = false
+  loadError.value = `视频加载失败：可能是文件已损坏或 WebView2 不支持的编码格式。\n文件路径：${props.file.path}`
+}
+
+function onVideoLoadStart() {
+  isLoading.value = true
+  loadError.value = ''
+}
+
+function onVideoCanPlay() {
+  isLoading.value = false
+}
+
+function reload() {
+  if (!videoEl.value) return
+  loadError.value = ''
+  isLoading.value = true
+  videoEl.value.load()
 }
 
 function timeFromEvent(e: PointerEvent): number {
@@ -128,13 +152,37 @@ watch(
       </div>
 
       <!-- 播放器 -->
-      <video
-        ref="videoEl"
-        :src="fileUrl"
-        class="w-full rounded-xl bg-black aspect-video"
-        controls
-        @loadedmetadata="onMeta"
-      ></video>
+      <div class="relative">
+        <video
+          ref="videoEl"
+          :src="fileUrl"
+          class="w-full rounded-xl bg-black aspect-video"
+          controls
+          preload="auto"
+          @loadstart="onVideoLoadStart"
+          @loadedmetadata="onMeta"
+          @canplay="onVideoCanPlay"
+          @error="onVideoError"
+        ></video>
+        <!-- 加载中遮罩 -->
+        <div
+          v-if="isLoading && !loadError"
+          class="absolute inset-0 flex items-center justify-center bg-black/40 text-white text-sm"
+        >
+          <Icon name="hourglass" /> 加载中...
+        </div>
+        <!-- 错误提示 -->
+        <div
+          v-if="loadError"
+          class="absolute inset-0 flex flex-col items-center justify-center bg-black/85 text-white text-sm p-6"
+        >
+          <Icon name="alert" class="text-rose-400 mb-2" />
+          <p class="whitespace-pre-line text-center">{{ loadError }}</p>
+          <button class="btn-soft mt-3" @click="reload">
+            <Icon name="refresh" /> 重试
+          </button>
+        </div>
+      </div>
 
       <!-- 时间轴 -->
       <div class="mt-5">

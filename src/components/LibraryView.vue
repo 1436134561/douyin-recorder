@@ -51,15 +51,23 @@ function setFmt(r: { id: string }, v: string) {
 }
 
 async function confirmDelete(r: RecordingInfo) {
-  const ok = window.confirm(`确定删除「${r.id}」吗？\n该文件将被永久移除。`)
+  const ok = await store.confirm({
+    title: '删除录像',
+    message: `确定删除「${r.id}」吗？\n该文件将被永久移除。`,
+    confirmText: '删除',
+    danger: true,
+  })
   if (!ok) return
   await store.deleteRecording(r.path)
 }
 
 async function confirmCleanup(workDir: string) {
-  const ok = window.confirm(
-    '确定清理该残留工作目录吗？\n其中的分片文件将被永久删除。',
-  )
+  const ok = await store.confirm({
+    title: '清理残留',
+    message: '确定清理该残留工作目录吗？\n其中的分片文件将被永久删除。',
+    confirmText: '清理',
+    danger: true,
+  })
   if (!ok) return
   await store.cleanupPending(workDir)
 }
