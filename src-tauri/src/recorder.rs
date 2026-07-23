@@ -3,6 +3,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{anyhow, Result};
 use tauri::{AppHandle, Emitter, Runtime};
 
@@ -36,6 +39,21 @@ fn sanitize_room_id(room_id: &str) -> String {
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect()
+}
+
+/// 在 Windows 上隐藏子进程的控制台窗口（防止 ffmpeg 弹出黑框）
+/// CREATE_NO_WINDOW = 0x08000000
+fn spawn_hidden(cmd: &mut Command) -> Result<std::process::Child> {
+    #[cfg(windows)]
+    let child = cmd
+        .creation_flags(0x08000000)
+        .spawn()
+        .map_err(|e| anyhow!("进程启动失败: {}", e))?;
+    #[cfg(not(windows))]
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("进程启动失败: {}", e))?;
+    Ok(child)
 }
 
 /// 根据配置与房间决定录制模式（stream 需有流地址，否则回退 screen）
@@ -127,61 +145,80 @@ fn start_ffmpeg(
     std::fs::create_dir_all(&work)?;
 
     let mode = decide_mode(cfg, room);
-    let child = if mode == "stream" {
+    let mut child = if mode == "stream" {
         let url = room
             .and_then(|r| r.stream_url.clone())
             .or_else(|| resolve_stream_url(room_id))
             .ok_or_else(|| anyhow!("房间 {} 未配置直播流地址", room_id))?;
         let seg_time = cfg.segment_minutes.max(1) * 60;
         let out_tmpl = work.join("seg_%03d.flv");
-        Command::new(ffmpeg_executable())
-            .args([
-                "-y",
-                "-i",
-                &url,
-                "-c",
-                "copy",
-                "-f",
-                "segment",
-                "-segment_time",
-                &seg_time.to_string(),
-                "-segment_format",
-                "flv",
-                "-reset_timestamps",
-                "1",
-                "-vsync",
-                "0",
-                &out_tmpl.to_string_lossy(),
-            ])
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow!("ffmpeg 录制启动失败: {}", e))?
+        let mut cmd = Command::new(ffmpeg_executable());
+        cmd.args([
+            "-y",
+            "-i",
+            &url,
+            "-c",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_time",
+            &seg_time.to_string(),
+            "-segment_format",
+            "flv",
+            "-reset_timestamps",
+            "1",
+            "-vsync",
+            "0",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+            &out_tmpl.to_string_lossy(),
+        ])
+        .stderr(std::process::Stdio::null());
+        spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 录制启动失败: {}", e))?
     } else {
         let src = cfg.screen_source.clone().unwrap_or_else(|| "desktop".into());
         let out_file = work.join("rec.mp4");
-        Command::new(ffmpeg_executable())
-            .args([
-                "-y",
-                "-f",
-                "gdigrab",
-                "-framerate",
-                "30",
-                "-i",
-                &src,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "mp4",
-                &out_file.to_string_lossy(),
-            ])
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow!("ffmpeg 屏幕录制启动失败: {}", e))?
+        let mut cmd = Command::new(ffmpeg_executable());
+        cmd.args([
+            "-y",
+            "-f",
+            "gdigrab",
+            "-framerate",
+            "30",
+            "-i",
+            &src,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mp4",
+            &out_file.to_string_lossy(),
+        ])
+        .stderr(std::process::Stdio::null());
+        spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 屏幕录制启动失败: {}", e))?
     };
+
+    // 启动后短暂等待，验证 ffmpeg 是否异常退出（仅非 0 退出码才算失败，
+    // 本地文件源播完会正常 exit 0，不误判）
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    if let Ok(Some(status)) = child.try_wait() {
+        if !status.success() {
+            return Err(anyhow!(
+                "ffmpeg 启动后立即异常退出（exit code {}）。可能原因：\n\
+                 ① 流地址无效或主播未在直播\n\
+                 ② ffmpeg 找不到或缺少编解码器\n\
+                 请检查直播间是否正在直播，或尝试手动填写 flv 流地址。",
+                status.code().unwrap_or(-1)
+            ));
+        }
+    }
 
     Ok(RecordingSession {
         room_id: room_id.to_string(),
@@ -199,8 +236,14 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(&session.work_dir) {
             for e in entries.flatten() {
                 let p = e.path();
+                // 只收集非空分片文件（过滤掉 ffmpeg 创建的空壳）
                 if p.extension().map(|x| x == "flv").unwrap_or(false) {
-                    files.push(p);
+                    if let Ok(meta) = std::fs::metadata(&p) {
+                        if meta.len() > 1024 {
+                            // 大于 1KB 视为有效分片
+                            files.push(p);
+                        }
+                    }
                 }
             }
         }
@@ -208,7 +251,11 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
     } else {
         let f = session.work_dir.join("rec.mp4");
         if f.exists() {
-            files.push(f);
+            if let Ok(meta) = std::fs::metadata(&f) {
+                if meta.len() > 1024 {
+                    files.push(f);
+                }
+            }
         }
     }
     files
@@ -242,13 +289,25 @@ pub fn stop_and_finalize<R: Runtime>(
         let _ = c.wait();
     }
     // 等待文件刷新
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    std::thread::sleep(std::time::Duration::from_millis(800));
 
     let files = gather_segments(&session);
     let cfg = state.lock().unwrap().config.clone();
     let merged = session.work_dir.join("merged.flv");
-    let final_name = format!("{}_{}.{}", room_id, now_ts(), cfg.output_format);
+    let final_name = format!("{}_{}.{}", sanitize_room_id(room_id), now_ts(), cfg.output_format);
     let final_path = cfg.output_dir.join(&final_name);
+
+    if files.is_empty() {
+        // 清理工作目录
+        let _ = std::fs::remove_dir_all(&session.work_dir);
+        return Err(anyhow!(
+            "本次录制没有产生有效的视频文件。\n\
+             可能原因：\n\
+             ① 录制时间太短（<2 秒）\n\
+             ② 直播流地址无效或主播已下播\n\
+             请确认直播间正在直播后再尝试录制。"
+        ));
+    }
 
     if files.len() > 1 {
         transcode::merge_segments(&files, &merged)?;
@@ -256,12 +315,13 @@ pub fn stop_and_finalize<R: Runtime>(
         let _ = std::fs::copy(f, &merged);
     }
 
-    if merged.exists() {
+    if merged.exists() && merged.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
         transcode::transcode(&merged, &final_path, &cfg.output_format)?;
     } else if let Some(f) = files.first() {
         transcode::transcode(f, &final_path, &cfg.output_format)?;
     } else {
-        return Err(anyhow!("未找到录制分片，可能录制过早结束"));
+        let _ = std::fs::remove_dir_all(&session.work_dir);
+        return Err(anyhow!("合并转码失败，无有效视频数据"));
     }
 
     let _ = std::fs::remove_dir_all(&session.work_dir);
