@@ -286,6 +286,9 @@ fn build_final_name(cfg: &AppConfig, room_id: &str, ts: i64) -> String {
 /// `keep_detector`：
 /// - `false`：用户主动停止 → 同时销毁检测器（传统模式）
 /// - `true`：检测器触发停止 → 保留检测器，等待下次循环触发（坐立检测循环模式）
+///
+/// 注意：`recordings.remove()` 在函数开头执行**就会清掉录制条目**，
+/// 即使后续转码失败，状态也已经改变 → 必须发 recording_stopped 事件让前端刷新。
 pub fn stop_and_finalize<R: Runtime>(
     room_id: &str,
     keep_detector: bool,
@@ -306,7 +309,14 @@ pub fn stop_and_finalize<R: Runtime>(
     }
     let mut session = match session {
         Some(s) => s,
-        None => return Err(anyhow!("房间 {} 未在录制", room_id)),
+        None => {
+            // 不在录制中。但前端 UI 可能认为在（状态漂移），仍然发出停止事件让它刷新
+            let _ = app.emit(
+                "recording_stopped",
+                serde_json::json!({ "room_id": room_id, "id": "" }),
+            );
+            return Err(anyhow!("房间 {} 未在录制", room_id));
+        }
     };
 
     // 停止 ffmpeg
@@ -325,6 +335,10 @@ pub fn stop_and_finalize<R: Runtime>(
     let final_path = cfg.output_dir.join(&final_name);
 
     if files.is_empty() {
+        let _ = app.emit(
+            "recording_stopped",
+            serde_json::json!({ "room_id": room_id, "id": "", "error": "无有效分片" }),
+        );
         return Err(anyhow!(
             "本次录制没有产生有效的视频文件（阈值 > 10KB）。\n\
              可能原因：\n\
@@ -335,9 +349,24 @@ pub fn stop_and_finalize<R: Runtime>(
     }
 
     if files.len() > 1 {
-        transcode::merge_segments(&files, &merged)?;
+        if let Err(e) = transcode::merge_segments(&files, &merged) {
+            let _ = app.emit(
+                "recording_stopped",
+                serde_json::json!({ "room_id": room_id, "id": "", "error": e.to_string() }),
+            );
+            let work = session.work_dir.clone();
+            return Err(anyhow!(
+                "合并失败: {}。原始分片保留在: {}",
+                e,
+                work.display()
+            ));
+        }
     } else if let Some(f) = files.first() {
         if let Err(e) = std::fs::copy(f, &merged) {
+            let _ = app.emit(
+                "recording_stopped",
+                serde_json::json!({ "room_id": room_id, "id": "", "error": e.to_string() }),
+            );
             return Err(anyhow!("复制分片失败: {}", e));
         }
     }
@@ -345,6 +374,10 @@ pub fn stop_and_finalize<R: Runtime>(
     if !merged.exists() || merged.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
         // 保留 work_dir 以便恢复
         let work = session.work_dir.clone();
+        let _ = app.emit(
+            "recording_stopped",
+            serde_json::json!({ "room_id": room_id, "id": "", "error": "merged.mp4 is empty" }),
+        );
         return Err(anyhow!(
             "合并后无有效数据。原始分片保留在: {}",
             work.display()
@@ -355,6 +388,10 @@ pub fn stop_and_finalize<R: Runtime>(
     let effective_fmt = if cfg.auto_mp4 { "mp4" } else { &cfg.output_format };
     if let Err(e) = transcode::transcode(&merged, &final_path, effective_fmt) {
         let work = session.work_dir.clone();
+        let _ = app.emit(
+            "recording_stopped",
+            serde_json::json!({ "room_id": room_id, "id": "", "error": e.to_string() }),
+        );
         return Err(anyhow!(
             "转码失败: {}。原始分片保留在: {}",
             e,

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, Manager, Runtime, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::autostart;
 use crate::config::{self, AppConfig, RoomConfig};
@@ -150,6 +150,31 @@ pub fn stop_recording(
     app: AppHandle,
     state: State<SharedState>,
 ) -> Result<RecordingInfo, String> {
+    let has_session = state.lock().unwrap().recordings.contains_key(&room_id);
+    if !has_session {
+        // 幂等：实际没在录制 → 只发事件让前端刷新，不动 detector（保留监控）
+        let _ = app.emit(
+            "recording_stopped",
+            serde_json::json!({ "room_id": room_id, "id": "" }),
+        );
+        return Ok(RecordingInfo {
+            id: String::new(),
+            room_id: room_id.clone(),
+            path: String::new(),
+            size_bytes: 0,
+            duration_sec: 0.0,
+            format: String::new(),
+            created_at: 0,
+        });
+    }
+    // 正在录制：清理 detector/logic + 停止 ffmpeg + 转码
+    {
+        let mut st = state.lock().unwrap();
+        if let Some(mut det) = st.detectors.remove(&room_id) {
+            det.stop();
+        }
+        st.logic.remove(&room_id);
+    }
     recorder::stop_and_finalize(&room_id, false, &app, state.inner()).map_err(|e| e.to_string())
 }
 

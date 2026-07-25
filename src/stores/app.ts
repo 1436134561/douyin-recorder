@@ -198,10 +198,14 @@ export const useStore = defineStore('app', () => {
 
   async function stopRecording(id: string) {
     await guarded('停止录制', async () => {
-      await api.stopRecording(id)
+      const info = await api.stopRecording(id)
       await refreshRecordings()
       await refreshPending()
       await refreshStatuses()
+      // 后端幂等：若之前不录制中只刷新了状态，不显示成功提示
+      if (info && info.id) {
+        notify('ok', `已停止：${info.id}`)
+      }
     })
   }
 
