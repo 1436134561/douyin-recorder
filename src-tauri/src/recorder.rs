@@ -152,8 +152,8 @@ pub fn begin_recording<R: Runtime>(
 /// 后台看护线程：每 5 秒检查 ffmpeg 是否还活着 + work_dir 文件是否在增长
 ///
 /// 故障检测：
-/// - ffmpeg 子进程死亡 → 自动清理 + 发 `recording_failed` 事件
-/// - work_dir 文件 60 秒无增长（说明流已停止推送数据）→ 同样处理
+/// - ffmpeg 子进程死亡 → 尝试保存部分分片 + 发 `recording_failed` 事件
+/// - work_dir 文件 180 秒无增长（说明流已停止推送数据）→ 同样处理
 ///
 /// 看护线程会一直运行直到本房间的 session 被移除（用户停止 / 检测器停 / 自动清理）
 fn spawn_recording_watcher<R: Runtime>(
@@ -164,7 +164,9 @@ fn spawn_recording_watcher<R: Runtime>(
     std::thread::spawn(move || {
         let mut last_total_bytes: u64 = 0;
         let mut last_growth = std::time::Instant::now();
-        const STALE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        // 放宽阈值：慢速直播流 60s 可能还没有新关键帧
+        const STALE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+        const NO_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -190,7 +192,7 @@ fn spawn_recording_watcher<R: Runtime>(
 
             // 2. ffmpeg 进程已退出？
             if !child_alive {
-                cleanup_dead_recording(
+                finalize_partial_or_cleanup(
                     &room_id,
                     "录制进程已退出（可能：流地址失效、主播下播、网络断开）",
                     &app,
@@ -215,20 +217,20 @@ fn spawn_recording_watcher<R: Runtime>(
                 last_total_bytes = total;
                 last_growth = std::time::Instant::now();
             } else if total == 0 {
-                // 启动后 20 秒内没数据也算早期失效
-                if last_growth.elapsed() > std::time::Duration::from_secs(20) {
-                    cleanup_dead_recording(
+                // 启动后 NO_DATA_TIMEOUT 秒内没数据就算早期失效
+                if last_growth.elapsed() > NO_DATA_TIMEOUT {
+                    finalize_partial_or_cleanup(
                         &room_id,
-                        "录制启动 20 秒内未收到任何数据（流地址可能无效）",
+                        "录制启动后 90 秒内未收到任何数据（流地址可能无效）",
                         &app,
                         &state,
                     );
                     break;
                 }
             } else if last_growth.elapsed() > STALE_TIMEOUT {
-                cleanup_dead_recording(
+                finalize_partial_or_cleanup(
                     &room_id,
-                    "录制文件 60 秒无增长（流可能已中断）",
+                    "录制文件 180 秒无增长（流可能已中断）；部分数据已尝试保留",
                     &app,
                     &state,
                 );
@@ -238,21 +240,33 @@ fn spawn_recording_watcher<R: Runtime>(
     });
 }
 
-/// 自动清理已失效的录制：移除 sessions + 发 recording_failed 事件
-fn cleanup_dead_recording<R: Runtime>(
+/// 看护触发时调用：先尝试用 stop_and_finalize 保存部分分片（不丢数据），
+/// 之后无论成功失败都发 recording_failed 事件通知前端
+fn finalize_partial_or_cleanup<R: Runtime>(
     room_id: &str,
     reason: &str,
     app: &AppHandle<R>,
     state: &Arc<Mutex<AppState>>,
 ) {
-    {
+    // 先把正在进行的 process 杀掉（避免 stop_and_finalize 内部 kill 已经死掉的进程出错）
+    let has_session = {
         let mut st = state.lock().unwrap();
-        let _session_removed = st.recordings.remove(room_id);
-        if let Some(mut d) = st.detectors.remove(room_id) {
-            d.stop();
+        if let Some(session) = st.recordings.get_mut(room_id) {
+            if let Some(mut c) = session.process.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            true
+        } else {
+            false
         }
-        st.logic.remove(room_id);
-        // 进程在工作被释放时由 std 关闭；不再手动 kill（已可能为已退出）
+    };
+
+    if has_session {
+        // 尝试保存分片为最终 mp4
+        if let Err(e) = stop_and_finalize(room_id, false, app, state) {
+            eprintln!("看护清理时保存部分数据失败：{}", e);
+        }
     }
 
     // 通知前端：清理状态 + 失败原因
@@ -363,7 +377,7 @@ fn start_ffmpeg(
     })
 }
 
-/// 收集有效分片文件
+/// 收集有效分片文件（阈值 1KB：排除 0 字节空壳文件，保留任何有内容的数据）
 fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if session.mode == "stream" {
@@ -372,8 +386,7 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
                 let p = e.path();
                 if p.extension().map(|x| x == "flv").unwrap_or(false) {
                     if let Ok(meta) = std::fs::metadata(&p) {
-                        // 阈值 10KB：排除 ffmpeg 创建的空壳文件，保留正常录制的分片
-                        if meta.len() > 10_240 {
+                        if meta.len() > 1_024 {
                             files.push(p);
                         }
                     }
@@ -385,7 +398,7 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
         let f = session.work_dir.join("rec.mp4");
         if f.exists() {
             if let Ok(meta) = std::fs::metadata(&f) {
-                if meta.len() > 10_240 {
+                if meta.len() > 1_024 {
                     files.push(f);
                 }
             }
@@ -468,9 +481,9 @@ pub fn stop_and_finalize<R: Runtime>(
             serde_json::json!({ "room_id": room_id, "id": "", "error": "无有效分片" }),
         );
         return Err(anyhow!(
-            "本次录制没有产生有效的视频文件（阈值 > 10KB）。\n\
+            "本次录制没有产生有效的视频文件。\n\
              可能原因：\n\
-             ① 录制时间太短（< 3 秒）\n\
+             ① 录制时间太短（< 1 秒）\n\
              ② 直播流地址无效或主播已下播\n\
              请确认直播间正在直播后再尝试录制。"
         ));

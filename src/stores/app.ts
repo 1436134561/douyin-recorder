@@ -72,7 +72,9 @@ export const useStore = defineStore('app', () => {
   function notify(type: 'ok' | 'err', msg: string) {
     toast.value = { type, msg }
     if (toastTimer) clearTimeout(toastTimer)
-    toastTimer = window.setTimeout(() => (toast.value = null), 3200)
+    // 失败 toast 停留 6 秒（更醒目），成功 3.2 秒
+    const ms = type === 'err' ? 6000 : 3200
+    toastTimer = window.setTimeout(() => (toast.value = null), ms)
   }
 
   // 统一包装异步调用：成功可给成功提示，失败显式弹出错误（避免「点了没反应」）
