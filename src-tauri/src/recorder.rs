@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::windows::process::CommandExt;
 
 use anyhow::{anyhow, Result};
+use serde_json::json;
 use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::config::{AppConfig, RoomConfig, VIDEO_EXTS};
@@ -117,6 +118,13 @@ pub fn begin_recording<R: Runtime>(
         .recordings
         .insert(room_id.to_string(), session);
 
+    // 启动后台看护：5 秒一次检查 ffmpeg 进程状态 + 文件增长
+    spawn_recording_watcher(
+        room_id.to_string(),
+        app.clone(),
+        state.clone(),
+    );
+
     if spawn_detector && cfg.detect_enabled {
         let (source, mode) = resolve_source(room_id, &cfg, room.as_ref());
         match crate::detector::spawn_detector(
@@ -139,6 +147,126 @@ pub fn begin_recording<R: Runtime>(
 
     let _ = app.emit("recording_started", serde_json::json!({ "room_id": room_id }));
     Ok(())
+}
+
+/// 后台看护线程：每 5 秒检查 ffmpeg 是否还活着 + work_dir 文件是否在增长
+///
+/// 故障检测：
+/// - ffmpeg 子进程死亡 → 自动清理 + 发 `recording_failed` 事件
+/// - work_dir 文件 60 秒无增长（说明流已停止推送数据）→ 同样处理
+///
+/// 看护线程会一直运行直到本房间的 session 被移除（用户停止 / 检测器停 / 自动清理）
+fn spawn_recording_watcher<R: Runtime>(
+    room_id: String,
+    app: AppHandle<R>,
+    state: Arc<Mutex<AppState>>,
+) {
+    std::thread::spawn(move || {
+        let mut last_total_bytes: u64 = 0;
+        let mut last_growth = std::time::Instant::now();
+        const STALE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+
+            // 1. 本房间是否还在录制？快速锁定以调用 try_wait
+            let (still_recording, work_dir_opt, child_alive) = {
+                let mut st = state.lock().unwrap();
+                match st.recordings.get_mut(&room_id) {
+                    Some(session) => {
+                        let alive = match session.process.as_mut() {
+                            Some(c) => c.try_wait().ok().map(|s| s.is_none()).unwrap_or(false),
+                            None => false,
+                        };
+                        (true, Some(session.work_dir.clone()), alive)
+                    }
+                    None => (false, None, false),
+                }
+            };
+
+            if !still_recording {
+                break;
+            }
+
+            // 2. ffmpeg 进程已退出？
+            if !child_alive {
+                cleanup_dead_recording(
+                    &room_id,
+                    "录制进程已退出（可能：流地址失效、主播下播、网络断开）",
+                    &app,
+                    &state,
+                );
+                break;
+            }
+
+            // 3. work_dir 文件大小 + 最近一次增长时间
+            let total = work_dir_opt
+                .as_deref()
+                .and_then(|d| std::fs::read_dir(d).ok())
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len()))
+                        .sum::<u64>()
+                })
+                .unwrap_or(0);
+
+            if total > last_total_bytes {
+                last_total_bytes = total;
+                last_growth = std::time::Instant::now();
+            } else if total == 0 {
+                // 启动后 20 秒内没数据也算早期失效
+                if last_growth.elapsed() > std::time::Duration::from_secs(20) {
+                    cleanup_dead_recording(
+                        &room_id,
+                        "录制启动 20 秒内未收到任何数据（流地址可能无效）",
+                        &app,
+                        &state,
+                    );
+                    break;
+                }
+            } else if last_growth.elapsed() > STALE_TIMEOUT {
+                cleanup_dead_recording(
+                    &room_id,
+                    "录制文件 60 秒无增长（流可能已中断）",
+                    &app,
+                    &state,
+                );
+                break;
+            }
+        }
+    });
+}
+
+/// 自动清理已失效的录制：移除 sessions + 发 recording_failed 事件
+fn cleanup_dead_recording<R: Runtime>(
+    room_id: &str,
+    reason: &str,
+    app: &AppHandle<R>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    {
+        let mut st = state.lock().unwrap();
+        let _session_removed = st.recordings.remove(room_id);
+        if let Some(mut d) = st.detectors.remove(room_id) {
+            d.stop();
+        }
+        st.logic.remove(room_id);
+        // 进程在工作被释放时由 std 关闭；不再手动 kill（已可能为已退出）
+    }
+
+    // 通知前端：清理状态 + 失败原因
+    let _ = app.emit(
+        "recording_failed",
+        json!({
+            "room_id": room_id,
+            "reason": reason,
+        }),
+    );
+    let _ = app.emit(
+        "recording_stopped",
+        json!({ "room_id": room_id, "id": "", "failed": true }),
+    );
 }
 
 /// 启动 ffmpeg 录制子进程

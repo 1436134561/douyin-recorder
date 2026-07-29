@@ -105,6 +105,13 @@ export const useStore = defineStore('app', () => {
       refreshStatuses()
       notify('ok', '录制已完成并合并转码')
     })
+    api.on('recording_failed', (p) => {
+      const e = p as { room_id: string; reason: string }
+      refreshStatuses()
+      refreshRecordings()
+      refreshPending()
+      notify('err', `录制已自动停止（${e.room_id}）：${e.reason}`)
+    })
     api.on('detection_event', (p) => {
       const e = p as DetectionEvent
       detections[e.room_id] = e
