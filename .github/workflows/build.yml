@@ -109,8 +109,6 @@ jobs:
           git push --delete origin latest 2>/dev/null || true
           gh release create latest \
             --title "抖音直播录屏 (最新自动构建)" \
-            --notes "Windows 安装程序（内置 ffmpeg，开箱即用）。支持直接粘贴抖音直播间链接自动解析录制。
-
-便携版：解压 douyin-recorder-portable.zip 后直接运行 抖音直播录屏.exe（免安装）。" \
+            --notes "安装版解压后运行安装程序。便携版解压 douyin-recorder-portable.zip 后直接运行 抖音直播录屏.exe（免安装）。" \
             douyin-recorder-setup.exe \
             douyin-recorder-portable.zip
