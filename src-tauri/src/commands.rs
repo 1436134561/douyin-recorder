@@ -310,39 +310,33 @@ pub fn get_status(room_id: String, state: State<SharedState>) -> RoomStatus {
     }
 }
 
-/// 若房间的 stream_url（或 room_id 本身）是抖音直播间网页 URL，
-/// 自动解析为 FLV 流地址并回写配置。
+/// 每次开始录制时重新解析抖音直播间 URL 为真实 FLV 流地址。
+///
+/// 重要：抖音 FLV 地址仅有几小时有效期。即使 stream_url 已经是真实流地址，
+/// 也必须强制重新解析，否则过期后 ffmpeg 能启动但收到 0 字节数据。
 async fn resolve_room_stream_if_needed(
     room_id: &str,
     state: &State<'_, SharedState>,
 ) -> Result<(), String> {
-    let maybe_url = {
+    // 用 https://live.douyin.com/{room_id} 强制重新解析
+    // （即使 stream_url 已经有值也覆盖，保证每次录制都用新鲜地址）
+    let re_url = format!("https://live.douyin.com/{}", room_id);
+    let _ = do_resolve_and_save(&re_url, room_id, state).await;
+
+    // 检查是否解析到了真实流地址
+    let has_stream = {
         let st = state.lock().unwrap();
         st.config
             .rooms
             .iter()
             .find(|r| r.id == room_id)
             .and_then(|r| r.stream_url.clone())
+            .map(|url| crate::stream_resolver::is_stream_url(&url))
+            .unwrap_or(false)
     };
-
-    // 已有流地址 → 检查是否需要解析
-    if let Some(ref url) = maybe_url {
-        // 已经是真实流地址，无需解析
-        if crate::stream_resolver::is_stream_url(url) {
-            return Ok(());
-        }
-        // stream_url 是抖音网页 URL → 解析它
-        if crate::stream_resolver::looks_like_douyin_url(url) {
-            return do_resolve_and_save(url, room_id, state).await;
-        }
-        return Ok(());
+    if !has_stream {
+        return Err("未能解析直播流地址，请确认主播正在直播".into());
     }
-
-    // stream_url 为空 → 检查 room_id 本身是否是抖音 URL（用户直接粘贴了链接作为 ID）
-    if crate::stream_resolver::looks_like_douyin_url(room_id) {
-        return do_resolve_and_save(room_id, room_id, state).await;
-    }
-
     Ok(())
 }
 

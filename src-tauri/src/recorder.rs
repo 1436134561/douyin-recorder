@@ -368,6 +368,38 @@ fn start_ffmpeg(
         }
     }
 
+    // 再等 3 秒检查：ffmpeg 进程是活着的，且 seg_000.flv 有没有开始收到数据？
+    // 若 3 秒后 seg_000.flv 仍是 0 字节 → 流地址大概率已过期（抖音 URL 时效性 ~几小时）
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    let seg_file = work.join("seg_000.flv");
+    let has_data = seg_file
+        .metadata()
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if !has_data {
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                return Err(anyhow!(
+                    "ffmpeg 启动后 {} 秒内异常退出（exit code {}）。\n\
+                     这通常意味着流地址无效或主播未在直播。\n\
+                     请确认直播间正在直播后再尝试录制。",
+                    4,
+                    status.code().unwrap_or(-1)
+                ));
+            }
+        }
+        return Err(anyhow!(
+            "开始录制 {} 秒后仍未收到数据。\n\
+             可能原因：\n\
+             ① 流地址已过期（抖音 FLV 地址有时效性）\n\
+             ② 直播间未在直播或被封禁\n\
+             ③ 网络防火墙 / 代理问题\n\
+             \n\
+             请确认直播间正在直播，并重新开始录制。",
+            4
+        ));
+    }
+
     Ok(RecordingSession {
         room_id: room_id.to_string(),
         mode: mode.to_string(),

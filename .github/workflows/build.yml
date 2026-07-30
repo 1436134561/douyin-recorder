@@ -73,11 +73,31 @@ jobs:
       - name: Build (tauri build -> nsis exe)
         run: pnpm tauri build
 
-      - name: Upload artifact
+      # 便携版：免安装直接运行（Olived 风格）
+      - name: Package Portable (no-install zip)
+        shell: pwsh
+        run: |
+          $portable = "portable/douyin-recorder"
+          New-Item -ItemType Directory -Path $portable -Force
+          # 拷贝主程序
+          Copy-Item src-tauri/target/release/douyin-recorder.exe -Destination "$portable/抖音直播录屏.exe" -Force
+          # 拷贝资源目录（嵌入式 Python + ffmpeg）
+          Copy-Item python-runtime -Destination "$portable/python" -Recurse -Force
+          Copy-Item ffmpeg -Destination "$portable/ffmpeg" -Recurse -Force
+          Compress-Archive -Path "$portable/*" -DestinationPath "douyin-recorder-portable.zip" -Force
+          Remove-Item portable -Recurse -Force
+
+      - name: Upload setup artifact
         uses: actions/upload-artifact@v4
         with:
           name: douyin-recorder-windows
           path: src-tauri/target/release/bundle/nsis/*.exe
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: douyin-recorder-portable
+          path: douyin-recorder-portable.zip
 
       # 发布为 GitHub Release（直接下载 exe，无需登录/解压）
       - name: Publish Release
@@ -92,5 +112,8 @@ jobs:
           git push --delete origin latest 2>/dev/null || true
           gh release create latest \
             --title "抖音直播录屏 (最新自动构建)" \
-            --notes "Windows 安装程序（内置 ffmpeg，开箱即用）。支持直接粘贴抖音直播间链接自动解析录制。" \
-            douyin-recorder-setup.exe
+            --notes "Windows 安装程序（内置 ffmpeg，开箱即用）。支持直接粘贴抖音直播间链接自动解析录制。
+
+便携版：解压 douyin-recorder-portable.zip 后直接运行 抖音直播录屏.exe（免安装）。" \
+            douyin-recorder-setup.exe \
+            douyin-recorder-portable.zip
