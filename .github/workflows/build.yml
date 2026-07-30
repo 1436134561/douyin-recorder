@@ -73,15 +73,12 @@ jobs:
       - name: Build (tauri build -> nsis exe)
         run: pnpm tauri build
 
-      # 便携版：免安装直接运行（Olived 风格）
       - name: Package Portable (no-install zip)
         shell: pwsh
         run: |
           $portable = "portable/douyin-recorder"
           New-Item -ItemType Directory -Path $portable -Force
-          # 拷贝主程序
-          Copy-Item src-tauri/target/release/douyin-recorder.exe -Destination "$portable/抖音直播录屏.exe" -Force
-          # 拷贝资源目录（嵌入式 Python + ffmpeg）
+          Copy-Item src-tauri/target/release/douyin-recorder.exe -Destination "$portable/douyin-recorder.exe" -Force
           Copy-Item python-runtime -Destination "$portable/python" -Recurse -Force
           Copy-Item ffmpeg -Destination "$portable/ffmpeg" -Recurse -Force
           Compress-Archive -Path "$portable/*" -DestinationPath "douyin-recorder-portable.zip" -Force
