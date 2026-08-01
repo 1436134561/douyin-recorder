@@ -144,11 +144,16 @@ pub fn start_monitor_inner(
     Ok(())
 }
 
+/// 停止录制（async + spawn_blocking：避免阻塞 WebView 主线程）
+///
+/// 关键：`stop_and_finalize` 是同步阻塞（杀进程 + 等待 + 合并 + 重新编码 H.264），
+/// 大文件可能要几分钟。如果用 sync fn，Tauri 会阻塞 WebView 主线程，
+/// Windows 显示「未响应」。这里把重活扔到 tokio 阻塞线程池，主线程立即返回。
 #[tauri::command]
-pub fn stop_recording(
+pub async fn stop_recording(
     room_id: String,
     app: AppHandle,
-    state: State<SharedState>,
+    state: State<'_, SharedState>,
 ) -> Result<RecordingInfo, String> {
     let has_session = state.lock().unwrap().recordings.contains_key(&room_id);
     if !has_session {
@@ -167,7 +172,7 @@ pub fn stop_recording(
             created_at: 0,
         });
     }
-    // 正在录制：清理 detector/logic + 停止 ffmpeg + 转码
+    // 正在录制：清理 detector/logic（快）
     {
         let mut st = state.lock().unwrap();
         if let Some(mut det) = st.detectors.remove(&room_id) {
@@ -175,7 +180,17 @@ pub fn stop_recording(
         }
         st.logic.remove(&room_id);
     }
-    recorder::stop_and_finalize(&room_id, false, &app, state.inner()).map_err(|e| e.to_string())
+
+    // 把 stop_and_finalize（重活）扔到阻塞线程池，不阻塞 WebView
+    let app_clone = app.clone();
+    let state_clone: SharedState = state.inner().clone();
+    let rid = room_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        recorder::stop_and_finalize(&rid, false, &app_clone, &state_clone)
+    })
+    .await
+    .map_err(|e| format!("join error: {}", e))?;
+    result.map_err(|e| e.to_string())
 }
 
 /// 停止监控（销毁检测器；若正在录制，则一并停止）
@@ -341,45 +356,53 @@ async fn resolve_room_stream_if_needed(
 }
 
 /// 执行解析并将结果回写到房间配置
+/// 
+/// 关键：加 6 秒超时。抖音 Webcast API 经常慢/限流，不超时会导致「开始录制」卡死。
 async fn do_resolve_and_save(
     url_to_resolve: &str,
     room_id: &str,
     state: &State<'_, SharedState>,
 ) -> Result<(), String> {
-    match crate::stream_resolver::resolve(url_to_resolve).await {
-        Ok(resolved) => {
-            let mut st = state.lock().unwrap();
-            // 如果房间名是空的，且解析拿到了主播昵称 → 填充，并尝试重命名已有文件
-            if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
-                room.stream_url = Some(resolved.flv);
-                let old_name = room.name.clone();
-                if room.name.is_none() || room.name.as_deref() == Some("") {
-                    if let Some(ref meta) = resolved.meta {
-                        if !meta.nickname.is_empty() {
-                            room.name = Some(meta.nickname.clone());
-                        }
-                    }
-                }
-                // 名称更新了 → 重命名 output_dir 里已有以房间 ID 开头的录制文件
-                if old_name.is_none() && room.name.is_some() {
-                    let new_name = room.name.clone().unwrap();
-                    let _ = rename_room_recordings(
-                        &st.config.output_dir,
-                        room_id,
-                        &new_name,
-                        st.config.auto_mp4,
-                        &st.config.output_format,
-                    );
+    // 6 秒超时；超时后端继续工作但不让用户等太久
+    let resolve_future = crate::stream_resolver::resolve(url_to_resolve);
+    let resolved = match tokio::time::timeout(std::time::Duration::from_secs(6), resolve_future).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return Err(format!(
+                "自动解析直播流地址失败：{}。请确认主播正在直播，或手动填写 flv/hls 流地址。",
+                e
+            ));
+        }
+        Err(_) => {
+            return Err("解析直播流地址超时（6 秒），请检查网络或稍后重试".into());
+        }
+    };
+    let mut st = state.lock().unwrap();
+    // 如果房间名是空的，且解析拿到了主播昵称 → 填充，并尝试重命名已有文件
+    if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
+        room.stream_url = Some(resolved.flv);
+        let old_name = room.name.clone();
+        if room.name.is_none() || room.name.as_deref() == Some("") {
+            if let Some(ref meta) = resolved.meta {
+                if !meta.nickname.is_empty() {
+                    room.name = Some(meta.nickname.clone());
                 }
             }
-            let _ = crate::config::save_config(&st.config);
-            Ok(())
         }
-        Err(e) => Err(format!(
-            "自动解析直播流地址失败：{}。请确认主播正在直播，或手动填写 flv/hls 流地址。",
-            e
-        )),
+        // 名称更新了 → 重命名 output_dir 里已有以房间 ID 开头的录制文件
+        if old_name.is_none() && room.name.is_some() {
+            let new_name = room.name.clone().unwrap();
+            let _ = rename_room_recordings(
+                &st.config.output_dir,
+                room_id,
+                &new_name,
+                st.config.auto_mp4,
+                &st.config.output_format,
+            );
+        }
     }
+    let _ = crate::config::save_config(&st.config);
+    Ok(())
 }
 
 /// 解析抖音直播间 URL 为真实流地址（供前端预览用，含元数据）
