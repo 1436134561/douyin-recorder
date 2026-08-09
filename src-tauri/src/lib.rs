@@ -26,6 +26,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_opener::init())
         .manage(shared)
         .on_window_event(|window, event| {
             // 关闭主窗口仅隐藏，不退出（托盘常驻）
@@ -41,6 +42,18 @@ pub fn run() {
 
             // 启动时强制显示主窗口（即使 visible=false 也能稳定出现）
             commands::show_window(app.handle());
+
+            // 关键：把用户配置的输出目录加入 asset 协议作用域
+            // 原因：tauri.conf.json 默认 scope 只含 $APPDATA/$VIDEO/$HOME（均解析到 C:\Users\...），
+            //       用户常用的 E:\存储\录屏 等盘符外目录会被 asset 协议拒绝（返回 403），
+            //       导致「预览剪辑」时 <video> 报"加载失败"。这里运行时按用户配置动态放行。
+            {
+                let st = app.state::<SharedState>();
+                let output_dir = st.lock().unwrap().config.output_dir.clone();
+                if let Err(e) = app.asset_protocol_scope().allow_directory(&output_dir, true) {
+                    eprintln!("[warn] allow output_dir ({:?}) failed: {}", output_dir, e);
+                }
+            }
 
             // 若配置开机自启，则确保注册表/启动项已写入
             {

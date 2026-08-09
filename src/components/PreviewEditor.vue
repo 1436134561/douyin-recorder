@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
+import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { useStore } from '../stores/app'
 import type { RecordingInfo, Segment } from '../lib/types'
 import Icon from './Icon.vue'
@@ -43,9 +44,30 @@ function onMeta() {
   loadError.value = ''
 }
 
+/**
+ * HTML5 video error.code 含义：
+ *   1 = MEDIA_ERR_ABORTED    —— 用户中止（不常见）
+ *   2 = MEDIA_ERR_NETWORK    —— 网络/加载失败（最常见：asset 协议 403、路径不存在）
+ *   3 = MEDIA_ERR_DECODE     —— 解码失败（编码不被 WebView2 支持）
+ *   4 = MEDIA_ERR_SRC_NOT_SUPPORTED —— 源不被支持（与 3 类似）
+ *
+ * 之前只显示一条通用文案无法区分根因；现在按 code 给针对性提示。
+ */
 function onVideoError() {
   isLoading.value = false
-  loadError.value = `视频加载失败：可能是文件已损坏或 WebView2 不支持的编码格式。\n文件路径：${props.file.path}`
+  const err = videoEl.value?.error
+  const code = err?.code ?? 0
+  const reason =
+    code === 1
+      ? '加载被中止'
+      : code === 2
+        ? '加载失败（可能是输出目录不在应用可访问范围内，或文件被占用）'
+        : code === 3
+          ? '解码失败：WebView2 不支持该编码格式'
+          : code === 4
+            ? '源不被支持：可能是编码格式或文件已损坏'
+            : '未知错误'
+  loadError.value = `视频加载失败：${reason}。\n错误码：${code || 'N/A'}\n文件路径：${props.file.path}`
 }
 
 function onVideoLoadStart() {
@@ -62,6 +84,26 @@ function reload() {
   loadError.value = ''
   isLoading.value = true
   videoEl.value.load()
+}
+
+/**
+ * 用系统默认播放器打开文件 —— asset:// 403 / 编码不支持时的兜底
+ * Windows 下 opener 会调 `start "" <path>`，用户可在 VLC / WMP / PotPlayer 中正常播放
+ */
+async function openInSystemPlayer() {
+  try {
+    await openPath(props.file.path)
+  } catch (e) {
+    store.notify('err', `系统播放器打开失败：${e}`)
+  }
+}
+
+async function showInFolder() {
+  try {
+    await revealItemInDir(props.file.path)
+  } catch (e) {
+    store.notify('err', `在文件夹中显示失败：${e}`)
+  }
 }
 
 function timeFromEvent(e: PointerEvent): number {
@@ -178,10 +220,23 @@ watch(
         >
           <Icon name="alert" class="text-rose-400 mb-2" />
           <p class="whitespace-pre-line text-center">{{ loadError }}</p>
-          <button class="btn-soft mt-3" @click="reload">
-            <Icon name="refresh" /> 重试
-          </button>
+          <div class="mt-4 flex flex-wrap gap-2 justify-center">
+            <button class="btn-soft" @click="reload">
+              <Icon name="refresh" /> 重试
+            </button>
+            <button class="btn-soft" @click="openInSystemPlayer">
+              <Icon name="external" /> 在系统播放器中打开
+            </button>
+            <button class="btn-soft" @click="showInFolder">
+              <Icon name="folder" /> 在文件夹中显示
+            </button>
+          </div>
         </div>
+      </div>
+
+      <!-- 时间轴下方兜底：内置播放器打不开时也能一键外部播放 -->
+      <div v-if="loadError" class="mt-3 text-xs text-ink-500 text-center">
+        如果多次重试仍失败，请点击上方「在系统播放器中打开」用 VLC / PotPlayer 等播放
       </div>
 
       <!-- 时间轴 -->

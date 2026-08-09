@@ -68,7 +68,12 @@ const stateClass: Record<string, string> = {
             <div>
               <div class="font-medium text-ink-800">{{ x.room.id }}</div>
               <div class="text-xs text-ink-400">
-                {{ x.status?.recording ? '录制中' : '监控中' }}
+                {{
+                  x.status?.recording && !x.status?.monitoring ? '录制中'
+                  : x.status?.monitoring && x.status?.recording && x.det?.state === 'sitting' ? '监控中（坐下待停）'
+                  : x.status?.monitoring ? '监控中'
+                  : '录制中'
+                }}
               </div>
             </div>
             <div class="flex items-center gap-2">

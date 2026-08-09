@@ -128,7 +128,7 @@ async function saveEdit() {
               {{ stateLabel[store.detections[r.id].state] || '未知' }}
             </span>
             <span
-              v-if="store.statuses[r.id]?.recording"
+              v-if="store.statuses[r.id]?.recording && !store.statuses[r.id]?.monitoring"
               class="badge bg-rose-50 text-rose-500"
             >
               <span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
@@ -142,11 +142,18 @@ async function saveEdit() {
               <Icon name="eye" /> 监控（待主播起立）
             </span>
             <span
-              v-else-if="store.statuses[r.id]?.monitoring"
+              v-else-if="store.statuses[r.id]?.recording && store.statuses[r.id]?.monitoring && store.detections[r.id]?.state === 'sitting'"
               class="badge bg-amber-50 text-amber-600"
               title="监控中：主播坐下，5秒后自动停止录制"
             >
               <Icon name="hourglass" /> 监控（坐下待停）
+            </span>
+            <span
+              v-else-if="store.statuses[r.id]?.recording"
+              class="badge bg-rose-50 text-rose-500"
+            >
+              <span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
+              REC
             </span>
           </div>
         </div>

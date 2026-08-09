@@ -17,8 +17,17 @@ pub fn get_config(state: State<SharedState>) -> AppConfig {
 }
 
 #[tauri::command]
-pub fn save_config(cfg: AppConfig, state: State<SharedState>) -> Result<(), String> {
+pub fn save_config(
+    cfg: AppConfig,
+    app: AppHandle,
+    state: State<SharedState>,
+) -> Result<(), String> {
     config::save_config(&cfg).map_err(|e| e.to_string())?;
+    // 同步更新 asset 协议 scope：用户改了输出目录后立即对新路径放行，
+    // 否则旧目录外的预览依然 403。
+    if let Err(e) = app.asset_protocol_scope().allow_directory(&cfg.output_dir, true) {
+        eprintln!("[warn] allow new output_dir ({:?}) failed: {}", cfg.output_dir, e);
+    }
     state.lock().unwrap().config = cfg;
     Ok(())
 }

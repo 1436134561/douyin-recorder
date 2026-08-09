@@ -22,6 +22,8 @@ export const useStore = defineStore('app', () => {
   const editorFile = ref<RecordingInfo | null>(null)
   const toast = ref<{ type: 'ok' | 'err'; msg: string } | null>(null)
   let toastTimer: number | undefined
+  // 状态轻量轮询：覆盖 detector 死亡、stop_and_finalize 同步阻塞期间前端 statuses 陈旧等场景
+  let statusPollTimer: number | undefined
 
   // 全局确认对话框状态（替代浏览器原生 confirm）
   const confirmDialog = ref<{
@@ -117,7 +119,21 @@ export const useStore = defineStore('app', () => {
     api.on('detection_event', (p) => {
       const e = p as DetectionEvent
       detections[e.room_id] = e
+      // 关键：检测器发出 Stop 决策时立刻拉一次最新 statuses。
+      // 后端在 emit 该事件后才调 stop_and_finalize（detector.rs:191 → :211），
+      // 但 recordings.remove()（recorder.rs:473）在函数最开头，IPC 到达时 recording 已为 false → 无竞态。
+      // 不挂 Start 决策是因为 getStatus 拿到的是后端实时状态，Start 后立刻就有。
+      if (e.decision === 'Stop') {
+        refreshStatuses()
+      }
     })
+
+    // 兜底轮询：3s 一次，覆盖检测器进程死亡、stop_and_finalize 同步阻塞等所有陈旧场景
+    if (statusPollTimer === undefined) {
+      statusPollTimer = window.setInterval(() => {
+        refreshStatuses()
+      }, 3000)
+    }
   }
 
   async function refreshRecordings() {
@@ -284,12 +300,14 @@ export const useStore = defineStore('app', () => {
   }
 
   /** 解析抖音直播间 URL 为真实流地址（供前端预览，含主播名/标题） */
-  async function resolveRoomUrl(url: string) {
-    const result = await guarded(
-      '解析直播间',
-      () => api.resolveRoomUrl(url),
-    )
-    return result as Record<string, unknown> | null
+  async function resolveRoomUrl(url: string): Promise<Record<string, unknown> | null> {
+    try {
+      return (await api.resolveRoomUrl(url)) as Record<string, unknown>
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : JSON.stringify(e)
+      notify('err', `解析直播间失败：${msg}`)
+      return null
+    }
   }
 
   /** 删除已完成录制 */
