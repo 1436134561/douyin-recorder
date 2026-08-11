@@ -591,6 +591,129 @@ pub async fn resolve(input: &str) -> Result<ResolvedStream> {
     ))
 }
 
+// ─── 直播状态探测（用于 monitor 轮询） ───
+
+/// 直播状态探测器：复用 reqwest::Client + ttwid cookie，避免每 30s 重新注册触发风控
+///
+/// 用法：每个房间共享一个实例即可（内部 client/ttwid 在多次 is_live 调用间复用）。
+/// 注意：当前实现是 `&mut self`（非 Send 友好），调用方需要独占访问。Monitor 线程独占持有，故 OK。
+pub struct LiveProbe {
+    client: reqwest::Client,
+    ttwid: Option<String>,
+    initialized: bool,
+}
+
+impl Default for LiveProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LiveProbe {
+    pub fn new() -> Self {
+        Self {
+            client: http_client(),
+            ttwid: None,
+            initialized: false,
+        }
+    }
+
+    /// 首次调用时注册 ttwid，后续调用复用缓存
+    async fn ensure_init(&mut self) -> Result<()> {
+        if !self.initialized {
+            // obtain_ttwid 即使失败也不阻断（返回空字符串时仍可继续探测）
+            self.ttwid = obtain_ttwid(&self.client).await.ok();
+            self.initialized = true;
+        }
+        Ok(())
+    }
+
+    /// 探测指定房间是否正在直播
+    /// - `Ok(true)`：开播中（API 返回流地址）
+    /// - `Ok(false)`：未开播 / 已下播（status_code != 0 或无流地址）
+    /// - `Err(_)`：网络错误 / JSON 解析失败（区分于「未开播」）
+    pub async fn is_live(&mut self, web_rid: &str) -> Result<bool> {
+        self.ensure_init().await?;
+        probe_live_via_api(web_rid, &self.client, self.ttwid.as_deref()).await
+    }
+}
+
+/// 仅探测直播状态：调用 Webcast API，只判断是否在播（不返回流地址）
+///
+/// 抽取自 fetch_webcast_api 以减少网络/解析开销（不递归提取流地址，只看 status_code 和有无 url 字段）
+async fn probe_live_via_api(
+    web_rid: &str,
+    client: &reqwest::Client,
+    ttwid: Option<&str>,
+) -> Result<bool> {
+    let params = [
+        ("aid", "6383"),
+        ("app_name", "douyin_web"),
+        ("live_id", "1"),
+        ("device_platform", "web"),
+        ("language", "zh-CN"),
+        ("browser_language", "zh-CN"),
+        ("browser_platform", "Win32"),
+        ("browser_name", "Chrome"),
+        ("browser_version", "131.0.0.0"),
+        ("web_rid", web_rid),
+    ];
+
+    let url = format!(
+        "https://live.douyin.com/webcast/room/web/enter/?{}",
+        params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&")
+    );
+
+    let mut req_builder = client
+        .get(&url)
+        .header("Referer", "https://live.douyin.com/")
+        .header("Accept", "application/json, text/plain, */*");
+
+    if let Some(tid) = ttwid {
+        if !tid.is_empty() {
+            req_builder = req_builder.header("Cookie", format!("ttwid={}", tid));
+        }
+    }
+
+    let resp = req_builder
+        .send()
+        .await
+        .map_err(|e| anyhow!("探测直播状态请求失败: {}", e))?;
+
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| anyhow!("读取探测响应失败: {}", e))?;
+
+    let data: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(anyhow!(
+                "Webcast API 返回非 JSON（HTTP {}），可能触发风控。响应前 200 字节: {}",
+                status,
+                &body[..body.len().min(200)]
+            ));
+        }
+    };
+
+    let status_code = data.get("status_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if status_code != 0 {
+        // status_code != 0 明确表示未开播（或已下播）
+        return Ok(false);
+    }
+
+    // 检查 data.* 字段里是否有流地址（任一 flv / hls 即可判定开播）
+    let mut flv_urls = HashMap::new();
+    let mut hls_urls = HashMap::new();
+    if let Some(data_val) = data.get("data") {
+        recursive_find_streams(data_val, &mut flv_urls, &mut hls_urls);
+    }
+
+    Ok(!flv_urls.is_empty() || !hls_urls.is_empty())
+}
+
 // ─── 单元测试 ───
 
 #[cfg(test)]

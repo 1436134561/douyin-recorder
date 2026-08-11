@@ -51,9 +51,15 @@ pub struct AppConfig {
     pub python_path: Option<String>,
     /// 房间列表
     pub rooms: Vec<RoomConfig>,
+    /// 直播状态探测间隔（秒）。监控线程每 N 秒探测一次开播状态。
+    /// 推荐 30 秒（抖音风控可接受，开播延迟感知也够用）。
+    /// 太短（<20s）可能触发风控；太长（>120s）开播延迟感知差。
+    #[serde(default = "default_30")]
+    pub monitor_poll_secs: u64,
 }
 
 fn default_true() -> bool { true }
+fn default_30() -> u64 { 30 }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -73,6 +79,7 @@ impl Default for AppConfig {
             screen_source: Some("desktop".into()),
             python_path: None,
             rooms: vec![],
+            monitor_poll_secs: 30,
         }
     }
 }

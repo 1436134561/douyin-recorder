@@ -19,6 +19,8 @@ export interface AppConfig {
   screen_source?: string | null
   python_path?: string | null
   rooms: RoomConfig[]
+  /** 直播状态探测间隔（秒）。monitor 线程每 N 秒探测一次开播。默认 30，范围 20-120 */
+  monitor_poll_secs?: number
 }
 
 export interface RecordingInfo {
@@ -43,8 +45,18 @@ export interface RoomStatus {
   room_id: string
   recording: boolean
   monitoring: boolean
+  /** 主播当前是否开播（由 monitor 线程探测；非监控房间为 false） */
+  live: boolean
   last_state: string
   last_motion: number
+}
+
+/// monitor 线程 emit 的事件 payload
+export interface MonitorEvent {
+  room_id: string
+  live: boolean
+  last_poll_ts: number
+  last_error?: string | null
 }
 
 export interface Segment {

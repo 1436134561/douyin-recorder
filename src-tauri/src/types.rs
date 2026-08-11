@@ -36,6 +36,8 @@ pub struct RoomStatus {
     pub room_id: String,
     pub recording: bool,
     pub monitoring: bool,
+    /// 主播当前是否在开播（由 monitor 线程探测；非监控房间始终 false）
+    pub live: bool,
     pub last_state: String,
     pub last_motion: f32,
 }

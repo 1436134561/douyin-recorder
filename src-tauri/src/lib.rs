@@ -4,6 +4,7 @@ mod config;
 mod detector;
 mod ffmpeg;
 mod logic;
+mod monitor;
 mod recorder;
 mod state;
 mod stream_resolver;

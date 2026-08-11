@@ -98,10 +98,13 @@ mod tests {
                 screen_source: Some("desktop".into()),
                 python_path: None,
                 rooms: vec![],
+                monitor_poll_secs: 30,
             },
             recordings: Default::default(),
             detectors: Default::default(),
             logic: Default::default(),
+            monitors: Default::default(),
+            monitor_states: Default::default(),
         }))
     }
 

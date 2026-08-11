@@ -6,6 +6,7 @@ import type {
   RoomConfig,
   RecordingInfo,
   DetectionEvent,
+  MonitorEvent,
   RoomStatus,
   Segment,
   PendingRecording,
@@ -125,6 +126,19 @@ export const useStore = defineStore('app', () => {
       // 不挂 Start 决策是因为 getStatus 拿到的是后端实时状态，Start 后立刻就有。
       if (e.decision === 'Stop') {
         refreshStatuses()
+      }
+    })
+    api.on('monitor_event', (p) => {
+      // 后端 monitor 线程每 N 秒探测直播状态后 emit；payload 含 live / last_poll_ts / last_error
+      const e = p as MonitorEvent
+      // 直接更新 statuses 缓存中的 live 字段，避免等下一次 refreshStatuses
+      if (statuses[e.room_id]) {
+        statuses[e.room_id].live = e.live
+      }
+      // 探测失败但监控中 → 提示一下
+      if (e.last_error && statuses[e.room_id]?.monitoring) {
+        // 不刷屏：只在 live=false 且有错误时静默记录
+        // console.warn(`[monitor] ${e.room_id}: ${e.last_error}`)
       }
     })
 

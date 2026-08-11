@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { useStore } from '../stores/app'
 import Icon from './Icon.vue'
 import { formatBytes, formatStamp } from '../lib/format'
@@ -38,6 +39,136 @@ async function doMerge() {
   selected.value = new Set()
 }
 
+// ─── 按主播分组 ───
+interface RoomGroup {
+  room: string            // 主播名（recording.room_id）
+  files: RecordingInfo[]  // 该主播的所有录屏，按时间倒序
+  totalBytes: number
+  latestTs: number
+}
+
+const grouped = computed<RoomGroup[]>(() => {
+  const map = new Map<string, RecordingInfo[]>()
+  for (const r of store.recordings) {
+    const key = r.room_id || '未分类'
+    if (!map.has(key)) map.set(key, [])
+    map.get(key)!.push(r)
+  }
+  return Array.from(map.entries())
+    .map(([room, files]) => {
+      const sorted = files.slice().sort((a, b) => b.created_at - a.created_at)
+      return {
+        room,
+        files: sorted,
+        totalBytes: sorted.reduce((s, f) => s + (f.size_bytes || 0), 0),
+        latestTs: Math.max(...sorted.map((f) => f.created_at || 0)),
+      }
+    })
+    .sort((a, b) => b.latestTs - a.latestTs)
+})
+
+async function mergeGroup(g: RoomGroup) {
+  if (g.files.length < 2) return
+  const ok = await store.confirm({
+    title: '合并本组',
+    message: `将「${g.room}」的 ${g.files.length} 个录屏合并为 1 个文件？\n（合并会按文件名排序，时间从早到晚）`,
+    confirmText: '合并',
+  })
+  if (!ok) return
+  const paths = g.files
+    .slice()
+    .sort((a, b) => a.created_at - b.created_at)
+    .map((f) => f.path)
+  await store.mergeSelected(paths, `${g.room}_merged`)
+}
+
+// ─── 右键菜单 ───
+interface CtxMenu {
+  visible: boolean
+  x: number
+  y: number
+  file: RecordingInfo | null
+}
+const ctx = ref<CtxMenu>({ visible: false, x: 0, y: 0, file: null })
+
+function openCtx(r: RecordingInfo, e: MouseEvent) {
+  e.preventDefault()
+  // 视口边缘翻转：避免菜单超出屏幕
+  const menuW = 200
+  const menuH = 180
+  let x = e.clientX
+  let y = e.clientY
+  if (x + menuW > window.innerWidth) x = window.innerWidth - menuW - 8
+  if (y + menuH > window.innerHeight) y = window.innerHeight - menuH - 8
+  ctx.value = { visible: true, x, y, file: r }
+}
+
+function closeCtx() {
+  ctx.value.visible = false
+  ctx.value.file = null
+}
+
+async function ctxRevealInFolder() {
+  const f = ctx.value.file
+  if (!f) return
+  closeCtx()
+  try {
+    await revealItemInDir(f.path)
+  } catch (e) {
+    store.notify('err', `在文件夹中显示失败：${e}`)
+  }
+}
+
+async function ctxOpenInPlayer() {
+  const f = ctx.value.file
+  if (!f) return
+  closeCtx()
+  try {
+    await openPath(f.path)
+  } catch (e) {
+    store.notify('err', `用系统播放器打开失败：${e}`)
+  }
+}
+
+function ctxPreviewClip() {
+  const f = ctx.value.file
+  if (!f) return
+  closeCtx()
+  store.openEditor(f)
+}
+
+async function ctxDelete() {
+  const f = ctx.value.file
+  if (!f) return
+  closeCtx()
+  await confirmDelete(f)
+}
+
+// 外部点击 / Escape / 滚动 都关闭菜单
+function onGlobalPointerDown(e: PointerEvent) {
+  if (!ctx.value.visible) return
+  const target = e.target as HTMLElement | null
+  if (target && target.closest('[data-ctx-menu]')) return
+  closeCtx()
+}
+function onGlobalKey(e: KeyboardEvent) {
+  if (e.key === 'Escape' && ctx.value.visible) closeCtx()
+}
+function onScroll() {
+  if (ctx.value.visible) closeCtx()
+}
+onMounted(() => {
+  window.addEventListener('pointerdown', onGlobalPointerDown)
+  window.addEventListener('keydown', onGlobalKey)
+  window.addEventListener('scroll', onScroll, true)
+})
+onUnmounted(() => {
+  window.removeEventListener('pointerdown', onGlobalPointerDown)
+  window.removeEventListener('keydown', onGlobalKey)
+  window.removeEventListener('scroll', onScroll, true)
+})
+
+// ─── 其他 ───
 async function doTranscode(r: { path: string; id: string }) {
   const fmt = transcodeFmt.value[r.id] || 'mp4'
   await store.transcode(r.path, fmt)
@@ -199,64 +330,132 @@ function switchTab(t: Tab) {
       </div>
     </div>
 
-    <!-- 已完成 -->
-    <div v-else class="card divide-y divide-ink-100">
-      <div v-if="store.recordings.length === 0" class="p-10 text-center text-ink-400">
+    <!-- 已完成：按主播分组 -->
+    <div v-else class="space-y-3">
+      <div v-if="store.recordings.length === 0" class="card p-10 text-center text-ink-400">
         还没有已完成的录制文件
       </div>
 
       <div
-        v-for="r in store.recordings"
-        :key="r.id"
-        class="flex items-center gap-4 p-4 hover:bg-ink-50/60 transition"
+        v-for="g in grouped"
+        :key="g.room"
+        class="card overflow-hidden"
       >
-        <input
-          type="checkbox"
-          class="w-4 h-4 rounded border-ink-300 text-brand-600 accent-brand-600"
-          :checked="selected.has(r.path)"
-          @change="toggle(r.path)"
-        />
-        <div class="w-10 h-10 rounded-xl bg-brand-50 text-brand-600 flex items-center justify-center shrink-0">
-          <Icon name="play" />
-        </div>
-        <div class="min-w-0 flex-1">
-          <div class="font-medium text-ink-800 truncate" :title="r.id">
-            {{ r.id }}
+        <!-- 分组标题栏 -->
+        <div class="flex items-center justify-between px-4 py-3 bg-ink-50/60 border-b border-ink-100">
+          <div class="flex items-center gap-2">
+            <div class="w-8 h-8 rounded-lg bg-brand-50 text-brand-600 flex items-center justify-center">
+              <Icon name="rooms" />
+            </div>
+            <div>
+              <div class="font-semibold text-ink-800">{{ g.room }}</div>
+              <div class="text-xs text-ink-400">
+                {{ g.files.length }} 个分段 · {{ formatBytes(g.totalBytes) }} · 最近 {{ formatStamp(g.latestTs) }}
+              </div>
+            </div>
           </div>
-          <div class="text-xs text-ink-400">
-            {{ formatStamp(r.created_at) }} · {{ formatBytes(r.size_bytes) }}
-          </div>
-        </div>
-
-        <button class="btn-soft" @click="store.openEditor(r)">
-          <Icon name="scissors" /> 预览剪辑
-        </button>
-
-        <div class="flex items-center gap-1">
-          <select
-            :value="fmtFor(r)"
-            class="input !w-20 !py-1.5"
-            @change="setFmt(r, ($event.target as HTMLSelectElement).value)"
+          <button
+            v-if="g.files.length >= 2"
+            class="btn-soft"
+            title="按时间顺序合并本主播所有分段"
+            @click="mergeGroup(g)"
           >
-            <option v-for="f in formats" :key="f" :value="f">{{ f }}</option>
-          </select>
-          <button class="btn-ghost !px-2.5" title="转码" @click="doTranscode(r)">
-            <Icon name="check" />
+            <Icon name="merge" /> 合并本组 ({{ g.files.length }})
           </button>
         </div>
 
-        <button
-          class="btn-ghost !px-2.5 text-rose-500"
-          title="删除"
-          @click="confirmDelete(r)"
-        >
-          <Icon name="trash" />
-        </button>
+        <!-- 分组内的录制列表 -->
+        <div class="divide-y divide-ink-100">
+          <div
+            v-for="r in g.files"
+            :key="r.id"
+            class="flex items-center gap-4 p-4 hover:bg-ink-50/60 transition"
+            @contextmenu.prevent="openCtx(r, $event)"
+          >
+            <input
+              type="checkbox"
+              class="w-4 h-4 rounded border-ink-300 text-brand-600 accent-brand-600"
+              :checked="selected.has(r.path)"
+              @change="toggle(r.path)"
+            />
+            <div class="w-10 h-10 rounded-xl bg-brand-50 text-brand-600 flex items-center justify-center shrink-0">
+              <Icon name="play" />
+            </div>
+            <div class="min-w-0 flex-1">
+              <div class="font-medium text-ink-800 truncate" :title="r.id">
+                {{ r.id }}
+              </div>
+              <div class="text-xs text-ink-400">
+                {{ formatStamp(r.created_at) }} · {{ formatBytes(r.size_bytes) }}
+              </div>
+            </div>
 
-        <span class="badge bg-ink-100 text-ink-500 uppercase w-14 justify-center">
-          {{ r.format }}
-        </span>
+            <button class="btn-soft" @click="store.openEditor(r)">
+              <Icon name="scissors" /> 预览剪辑
+            </button>
+
+            <div class="flex items-center gap-1">
+              <select
+                :value="fmtFor(r)"
+                class="input !w-20 !py-1.5"
+                @change="setFmt(r, ($event.target as HTMLSelectElement).value)"
+              >
+                <option v-for="f in formats" :key="f" :value="f">{{ f }}</option>
+              </select>
+              <button class="btn-ghost !px-2.5" title="转码" @click="doTranscode(r)">
+                <Icon name="check" />
+              </button>
+            </div>
+
+            <button
+              class="btn-ghost !px-2.5 text-rose-500"
+              title="删除"
+              @click="confirmDelete(r)"
+            >
+              <Icon name="trash" />
+            </button>
+
+            <span class="badge bg-ink-100 text-ink-500 uppercase w-14 justify-center">
+              {{ r.format }}
+            </span>
+          </div>
+        </div>
       </div>
+    </div>
+
+    <!-- 右键菜单（fixed 定位到鼠标位置） -->
+    <div
+      v-if="ctx.visible"
+      data-ctx-menu
+      class="fixed z-50 min-w-[200px] bg-white border border-ink-200 rounded-xl shadow-lg py-1 animate-fade-in"
+      :style="{ left: ctx.x + 'px', top: ctx.y + 'px' }"
+    >
+      <button
+        class="w-full px-3 py-2 text-left text-sm hover:bg-ink-50 flex items-center gap-2"
+        @click="ctxRevealInFolder"
+      >
+        <Icon name="folder" /> 在文件夹中显示
+      </button>
+      <button
+        class="w-full px-3 py-2 text-left text-sm hover:bg-ink-50 flex items-center gap-2"
+        @click="ctxOpenInPlayer"
+      >
+        <Icon name="external" /> 用系统播放器打开
+      </button>
+      <div class="border-t border-ink-100 my-1"></div>
+      <button
+        class="w-full px-3 py-2 text-left text-sm hover:bg-ink-50 flex items-center gap-2"
+        @click="ctxPreviewClip"
+      >
+        <Icon name="scissors" /> 预览剪辑
+      </button>
+      <div class="border-t border-ink-100 my-1"></div>
+      <button
+        class="w-full px-3 py-2 text-left text-sm hover:bg-rose-50 text-rose-500 flex items-center gap-2"
+        @click="ctxDelete"
+      >
+        <Icon name="trash" /> 删除
+      </button>
     </div>
   </div>
 </template>

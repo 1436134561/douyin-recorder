@@ -71,6 +71,7 @@ const stateClass: Record<string, string> = {
                 {{
                   x.status?.recording && !x.status?.monitoring ? '录制中'
                   : x.status?.monitoring && x.status?.recording && x.det?.state === 'sitting' ? '监控中（坐下待停）'
+                  : x.status?.monitoring && !x.status?.live ? '监控中（等待开播）'
                   : x.status?.monitoring ? '监控中'
                   : '录制中'
                 }}

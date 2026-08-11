@@ -107,50 +107,64 @@ pub async fn start_recording(
     recorder::begin_recording(&room_id, true, &app, state.inner()).map_err(|e| e.to_string())
 }
 
-/// 开始监控：仅启动检测器，主播站立/有动作时自动开始，坐下无动作时自动停止
-/// 同样支持自动解析直播间 URL。
+/// 开始监控：启动 monitor 轮询线程
+///
+/// 新流程：
+/// 1. 启动 monitor 轮询线程（每 cfg.monitor_poll_secs 秒探测一次开播状态）
+/// 2. monitor 线程检测到开播 → 自动 begin_recording + spawn_detector(armed_start=true)
+/// 3. monitor 线程检测到下播 → stop_and_finalize 收尾 + 停 detector
+///
+/// 即使主播当前未开播也会成功（monitor 线程会持续轮询直到开播）。
 #[tauri::command]
 pub async fn start_monitor(
     room_id: String,
     app: AppHandle,
     state: State<'_, SharedState>,
 ) -> Result<(), String> {
-    resolve_room_stream_if_needed(&room_id, &state).await?;
-    start_monitor_inner(&app, state.inner(), &room_id).map_err(|e| e.to_string())
+    let state_inner = state.inner().clone();
+    {
+        let mut st = state_inner.lock().unwrap();
+        if st.monitors.contains_key(&room_id) {
+            return Ok(()); // 已在监控
+        }
+    }
+
+    // 检查房间配置（不强制要求流地址，monitor 会自己解析）
+    let room_exists = state_inner
+        .lock()
+        .unwrap()
+        .config
+        .rooms
+        .iter()
+        .any(|r| r.id == room_id);
+    if !room_exists {
+        return Err(format!("房间 {} 不存在，请先添加", room_id));
+    }
+
+    let handle = crate::monitor::start(room_id.clone(), app, state_inner.clone());
+    state_inner
+        .lock()
+        .unwrap()
+        .monitors
+        .insert(room_id, handle);
+    Ok(())
 }
 
 /// 监控核心逻辑（供命令与托盘菜单复用）
+///
+/// 新版：仅启动 monitor 轮询线程，不再直接 spawn_detector。
 pub fn start_monitor_inner(
-    app: &AppHandle,
+    _app: &AppHandle,
     state: &Arc<Mutex<crate::state::AppState>>,
     room_id: &str,
 ) -> anyhow::Result<()> {
-    if state.lock().unwrap().detectors.contains_key(room_id) {
+    if state.lock().unwrap().monitors.contains_key(room_id) {
         return Ok(()); // 已在监控
     }
-    let (cfg, room) = {
-        let st = state.lock().unwrap();
-        let cfg = st.config.clone();
-        let room = st.config.rooms.iter().find(|r| r.id == room_id).cloned();
-        (cfg, room)
-    };
-    let (source, mode) = recorder::resolve_source(room_id, &cfg, room.as_ref());
-    if mode == "stream" && source.is_empty() {
-        return Err(anyhow::anyhow!("房间 {} 未配置直播流地址，无法监控", room_id));
-    }
-    let h = crate::detector::spawn_detector(
-        room_id.to_string(),
-        source,
-        mode,
-        cfg.sensitivity,
-        cfg.sit_stop_seconds,
-        true,
-        cfg.python_path.clone(),
-        app.clone(),
-        state.clone(),
-    )?;
-    state.lock().unwrap().detectors.insert(room_id.to_string(), h);
-    Ok(())
+    // 同步版本：调用方负责 manage AppHandle（实际由 start_monitor async 版本处理 emit 等）
+    // 这里保留接口兼容 tray 调用，但 monitor::start 需要 AppHandle<R>；
+    // 托盘菜单请直接调用 commands::start_monitor（async 版本）。
+    anyhow::bail!("请使用 async start_monitor；此同步入口仅保留兼容")
 }
 
 /// 停止录制（async + spawn_blocking：避免阻塞 WebView 主线程）
@@ -202,15 +216,23 @@ pub async fn stop_recording(
     result.map_err(|e| e.to_string())
 }
 
-/// 停止监控（销毁检测器；若正在录制，则一并停止）
+/// 停止监控（停 monitor 线程；若正在录制，则一并停止）
 #[tauri::command]
 pub fn stop_monitor(room_id: String, state: State<SharedState>) -> Result<(), String> {
     let mut st = state.lock().unwrap();
+    // 1. 停 monitor 线程
+    if let Some(handle) = st.monitors.remove(&room_id) {
+        crate::monitor::stop(handle);
+    }
+    // 2. 清理 monitor_states
+    st.monitor_states.remove(&room_id);
+    // 3. 停 detector（可能在 monitor 线程外独立启动的）
     if let Some(mut h) = st.detectors.remove(&room_id) {
         h.stop();
     }
+    // 4. 清理 logic
     st.logic.remove(&room_id);
-    // 录制由前端另行调用 stop_recording 收尾（keep_detector=false 会自动清理）
+    // 5. 录制由前端另行调用 stop_recording 收尾（keep_detector=false 会自动清理）
     Ok(())
 }
 
@@ -328,7 +350,9 @@ pub fn get_status(room_id: String, state: State<SharedState>) -> RoomStatus {
     RoomStatus {
         room_id: room_id.clone(),
         recording: st.recordings.contains_key(&room_id),
-        monitoring: st.detectors.contains_key(&room_id),
+        monitoring: st.monitors.contains_key(&room_id),
+        // 主播当前是否开播（monitor 线程维护；非监控房间返回 false）
+        live: st.monitor_live(&room_id),
         last_state: String::new(),
         last_motion: 0.0,
     }
@@ -336,8 +360,13 @@ pub fn get_status(room_id: String, state: State<SharedState>) -> RoomStatus {
 
 /// 每次开始录制时重新解析抖音直播间 URL 为真实 FLV 流地址。
 ///
-/// 重要：抖音 FLV 地址仅有几小时有效期。即使 stream_url 已经是真实流地址，
+/// 重要：抖音 FLV 地址仅有几分钟有效期。即使 stream_url 已经是真实流地址，
 /// 也必须强制重新解析，否则过期后 ffmpeg 能启动但收到 0 字节数据。
+///
+/// Bug C 修复：之前的 `let _ = do_resolve_and_save(...)` 会吞掉解析错误，导致
+/// 主播在播但解析被风控/限流/超时时，旧缓存 stream_url 蒙混过关，
+/// ffmpeg 拿过期 URL 启动即失败（退出码 -1414549496 = 0xABABABAB 异常终止）。
+/// 现在改为：解析失败直接报错给前端，并提示主播是否在直播、风控限制、或网络问题。
 async fn resolve_room_stream_if_needed(
     room_id: &str,
     state: &State<'_, SharedState>,
@@ -345,9 +374,22 @@ async fn resolve_room_stream_if_needed(
     // 用 https://live.douyin.com/{room_id} 强制重新解析
     // （即使 stream_url 已经有值也覆盖，保证每次录制都用新鲜地址）
     let re_url = format!("https://live.douyin.com/{}", room_id);
-    let _ = do_resolve_and_save(&re_url, room_id, state).await;
 
-    // 检查是否解析到了真实流地址
+    // 修复 Bug C：去掉 `let _ =`，解析失败立即向上抛
+    if let Err(e) = do_resolve_and_save(&re_url, room_id, state).await {
+        let msg = e.to_string();
+        // 区分错误类型，给用户更可操作的提示
+        let hint = if msg.contains("status_code") || msg.contains("未在直播") || msg.contains("未返回流地址") {
+            "（主播可能未在直播，或抖音风控拦截了此房间）"
+        } else if msg.contains("请求") || msg.contains("非 JSON") {
+            "（网络异常或抖音风控拦截，请稍后重试）"
+        } else {
+            "（请检查房间号或网络）"
+        };
+        return Err(format!("解析直播流地址失败：{} {}", msg, hint));
+    }
+
+    // 二次校验：解析成功也确保 stream_url 字段被实际写入了
     let has_stream = {
         let st = state.lock().unwrap();
         st.config
@@ -359,7 +401,7 @@ async fn resolve_room_stream_if_needed(
             .unwrap_or(false)
     };
     if !has_stream {
-        return Err("未能解析直播流地址，请确认主播正在直播".into());
+        return Err("未能获取到可用直播流地址，请确认主播正在直播".into());
     }
     Ok(())
 }

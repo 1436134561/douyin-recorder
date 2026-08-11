@@ -326,7 +326,7 @@ fn start_ffmpeg(
             "5",
             &out_tmpl.to_string_lossy(),
         ])
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
         spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 录制启动失败: {}", e))?
     } else {
         let src = cfg.screen_source.clone().unwrap_or_else(|| "desktop".into());
@@ -350,26 +350,23 @@ fn start_ffmpeg(
             "mp4",
             &out_file.to_string_lossy(),
         ])
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
         spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 屏幕录制启动失败: {}", e))?
     };
+
+    // 启动后台线程读 stderr（限前 4KB），失败时放进错误文案告诉用户真实原因
+    let stderr_buf = capture_stderr(child.stderr.take());
 
     // 启动后短暂等待，验证 ffmpeg 是否异常退出（仅非 0 退出码视为失败）
     std::thread::sleep(std::time::Duration::from_millis(600));
     if let Ok(Some(status)) = child.try_wait() {
         if !status.success() {
-            return Err(anyhow!(
-                "ffmpeg 启动后立即异常退出（exit code {}）。可能原因：\n\
-                 ① 流地址无效或主播未在直播\n\
-                 ② ffmpeg 找不到或缺少编解码器\n\
-                 请检查直播间是否正在直播，或尝试手动填写 flv 流地址。",
-                status.code().unwrap_or(-1)
-            ));
+            return Err(ffmpeg_exit_error(&read_stderr(&stderr_buf), status.code(), 0, mode));
         }
     }
 
     // 再等 3 秒检查：ffmpeg 进程是活着的，且 seg_000.flv 有没有开始收到数据？
-    // 若 3 秒后 seg_000.flv 仍是 0 字节 → 流地址大概率已过期（抖音 URL 时效性 ~几小时）
+    // 若 3 秒后 seg_000.flv 仍是 0 字节 → 流地址大概率已过期（抖音 URL 时效性 ~几分钟）
     std::thread::sleep(std::time::Duration::from_millis(3000));
     let seg_file = work.join("seg_000.flv");
     let has_data = seg_file
@@ -379,24 +376,20 @@ fn start_ffmpeg(
     if !has_data {
         if let Ok(Some(status)) = child.try_wait() {
             if !status.success() {
-                return Err(anyhow!(
-                    "ffmpeg 启动后 {} 秒内异常退出（exit code {}）。\n\
-                     这通常意味着流地址无效或主播未在直播。\n\
-                     请确认直播间正在直播后再尝试录制。",
-                    4,
-                    status.code().unwrap_or(-1)
-                ));
+                return Err(ffmpeg_exit_error(&read_stderr(&stderr_buf), status.code(), 4, mode));
             }
         }
         return Err(anyhow!(
             "开始录制 {} 秒后仍未收到数据。\n\
              可能原因：\n\
-             ① 流地址已过期（抖音 FLV 地址有时效性）\n\
+             ① 流地址已过期（抖音 FLV 地址时效性 ~几分钟，下次会自动重新解析）\n\
              ② 直播间未在直播或被封禁\n\
              ③ 网络防火墙 / 代理问题\n\
              \n\
-             请确认直播间正在直播，并重新开始录制。",
-            4
+             请确认直播间正在直播，并重新开始录制。\n\
+             \nffmpeg stderr 尾部：\n{}",
+            4,
+            read_stderr(&stderr_buf)
         ));
     }
 
@@ -407,6 +400,79 @@ fn start_ffmpeg(
         process: Some(child),
         started_at: now_ts(),
     })
+}
+
+/// 后台读 ffmpeg stderr，保留最近 4KB（Vec<u8> + Mutex + 截断）
+fn capture_stderr(stderr: Option<std::process::ChildStderr>) -> Arc<Mutex<Vec<u8>>> {
+    let buf = Arc::new(Mutex::new(Vec::with_capacity(4096)));
+    if let Some(mut s) = stderr {
+        let buf_clone = buf.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut tmp = [0u8; 1024];
+            loop {
+                match s.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut b = buf_clone.lock().unwrap();
+                        if b.len() < 4096 {
+                            let room = 4096 - b.len();
+                            b.extend_from_slice(&tmp[..n.min(room)]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    buf
+}
+
+/// 取 stderr buffer 内容的可读字符串（截断到 1KB 用于错误消息）
+fn read_stderr(buf: &Mutex<Vec<u8>>) -> String {
+    let bytes = buf.lock().unwrap();
+    if bytes.is_empty() {
+        return String::from("（stderr 无输出）");
+    }
+    String::from_utf8_lossy(&bytes).chars().take(1024).collect()
+}
+
+/// 生成 ffmpeg 退出错误（包含十六进制退出码 + stderr 尾部 + 分类提示）
+fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &str) -> anyhow::Error {
+    let c = code.unwrap_or(-1);
+    let hex = if c >= 0 {
+        format!("0x{:08X}", c as u32)
+    } else {
+        format!("0x{:08X} (signed: {})", c as u32, c)
+    };
+
+    // 根据 stderr 内容分类提示
+    let hint = if stderr.contains("403") || stderr.contains("Forbidden") {
+        "（最可能：流地址已过期，HTTP 403。请重新开始录制，会自动重新解析）"
+    } else if stderr.contains("Connection refused") || stderr.contains("timeout") || stderr.contains("timed out") {
+        "（最可能：网络不可达 — 防火墙/代理/抖音风控）"
+    } else if stderr.contains("404") || stderr.contains("Not Found") {
+        "（最可能：流地址已失效 — 请重新开始录制自动重新解析）"
+    } else if mode == "screen" {
+        "（最可能：屏幕捕获源不可用 — 检查屏幕源设置）"
+    } else {
+        "（请确认主播正在直播，或参考下方 ffmpeg stderr）"
+    };
+
+    anyhow!(
+        "ffmpeg 启动后{}秒内异常退出（exit code: {} / {}）{}\n\n\
+         排查方向：\n\
+         ① 流地址已过期（抖音 flv URL 几分钟就失效，重新开始录制会自动重新解析）\n\
+         ② 主播未在直播或被风控拦截\n\
+         ③ ffmpeg 找不到或缺少编解码器\n\
+         \n\
+         ffmpeg stderr 尾部：\n{}",
+        waited_secs,
+        c,
+        hex,
+        hint,
+        stderr
+    )
 }
 
 /// 收集有效分片文件（阈值 1KB：排除 0 字节空壳文件，保留任何有内容的数据）

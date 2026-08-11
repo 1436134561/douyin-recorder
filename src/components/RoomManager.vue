@@ -111,10 +111,29 @@ async function saveEdit() {
             </div>
             <div class="min-w-0">
               <div class="font-semibold text-ink-800 truncate">{{ r.name || r.id }}</div>
-              <div class="text-xs text-ink-400 truncate">
+              <div class="text-xs text-ink-400 truncate flex items-center gap-1.5">
                 <span v-if="r.name && r.id !== r.name">{{ r.id }} · </span>
                 <span v-if="r.stream_url" class="text-emerald-500">已配置流地址</span>
                 <span v-else class="text-amber-500">待解析</span>
+                <span
+                  v-if="store.statuses[r.id]?.monitoring"
+                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium"
+                  :class="
+                    store.statuses[r.id]?.live
+                      ? 'bg-emerald-50 text-emerald-600'
+                      : 'bg-ink-100 text-ink-500'
+                  "
+                >
+                  <span
+                    class="w-1 h-1 rounded-full"
+                    :class="
+                      store.statuses[r.id]?.live
+                        ? 'bg-emerald-500 animate-pulse'
+                        : 'bg-ink-400'
+                    "
+                  ></span>
+                  {{ store.statuses[r.id]?.live ? '已开播' : '未开播' }}
+                </span>
               </div>
             </div>
           </div>
