@@ -560,34 +560,59 @@ pub async fn resolve(input: &str) -> Result<ResolvedStream> {
     let web_rid = extract_web_rid(input)?;
     let client = http_client();
 
+    // 收集每个策略的失败原因，最后一并告诉用户（解决「看不到真错误」的问题）
+    let mut attempts: Vec<(String, String)> = Vec::new(); // (策略名, 错误)
+
     // 方案 1: Webcast API
-    if let Ok((urls, meta)) = fetch_webcast_api(&web_rid, &client).await {
-        if let Some(flv) = best_flv(&urls) {
-            return Ok(ResolvedStream {
-                flv,
-                hls: best_hls(&urls),
-                meta,
-            });
+    match fetch_webcast_api(&web_rid, &client).await {
+        Ok((urls, meta)) => {
+            if let Some(flv) = best_flv(&urls) {
+                return Ok(ResolvedStream {
+                    flv,
+                    hls: best_hls(&urls),
+                    meta,
+                });
+            }
+            attempts.push(("Webcast API".into(), "未返回流地址".into()));
+        }
+        Err(e) => {
+            attempts.push(("Webcast API".into(), format!("{}", e)));
         }
     }
 
     // 方案 2: 页面 HTML RENDER_DATA（备选）
-    if let Ok((urls, meta)) = fetch_page_render_data(&web_rid, &client).await {
-        if let Some(flv) = best_flv(&urls) {
-            return Ok(ResolvedStream {
-                flv,
-                hls: best_hls(&urls),
-                meta,
-            });
+    match fetch_page_render_data(&web_rid, &client).await {
+        Ok((urls, meta)) => {
+            if let Some(flv) = best_flv(&urls) {
+                return Ok(ResolvedStream {
+                    flv,
+                    hls: best_hls(&urls),
+                    meta,
+                });
+            }
+            attempts.push(("页面 RENDER_DATA".into(), "未返回流地址".into()));
+        }
+        Err(e) => {
+            attempts.push(("页面 RENDER_DATA".into(), format!("{}", e)));
         }
     }
 
+    // 两个策略都失败 → 详细列出每个策略的错误，方便用户/排查定位
+    let detail = attempts
+        .iter()
+        .map(|(name, err)| format!("  · {}：{}", name, err))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     Err(anyhow!(
-        "无法获取直播流地址。请确认：\n\
-         1. 主播正在直播\n\
+        "无法获取直播流地址（房间 {}）。请确认：\n\
+         1. 主播正在直播（抖音部分直播间会做地域限制或风控）\n\
          2. 房间号/链接正确\n\
          3. 网络连接正常\n\
-         \n提示：部分直播间可能因地域限制或风控策略暂时无法解析"
+         \n\
+         各解析策略失败原因：\n{}",
+        web_rid,
+        detail
     ))
 }
 

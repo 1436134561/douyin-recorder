@@ -366,27 +366,17 @@ pub fn get_status(room_id: String, state: State<SharedState>) -> RoomStatus {
 /// Bug C 修复：之前的 `let _ = do_resolve_and_save(...)` 会吞掉解析错误，导致
 /// 主播在播但解析被风控/限流/超时时，旧缓存 stream_url 蒙混过关，
 /// ffmpeg 拿过期 URL 启动即失败（退出码 -1414549496 = 0xABABABAB 异常终止）。
-/// 现在改为：解析失败直接报错给前端，并提示主播是否在直播、风控限制、或网络问题。
+/// 现在改为：解析失败直接报错给前端，由 resolve() 提供每个策略的具体失败原因。
 async fn resolve_room_stream_if_needed(
     room_id: &str,
     state: &State<'_, SharedState>,
 ) -> Result<(), String> {
-    // 用 https://live.douyin.com/{room_id} 强制重新解析
-    // （即使 stream_url 已经有值也覆盖，保证每次录制都用新鲜地址）
     let re_url = format!("https://live.douyin.com/{}", room_id);
 
     // 修复 Bug C：去掉 `let _ =`，解析失败立即向上抛
+    // resolve() 现在自带详细错误信息（各策略失败原因），这里只需直接传播
     if let Err(e) = do_resolve_and_save(&re_url, room_id, state).await {
-        let msg = e.to_string();
-        // 区分错误类型，给用户更可操作的提示
-        let hint = if msg.contains("status_code") || msg.contains("未在直播") || msg.contains("未返回流地址") {
-            "（主播可能未在直播，或抖音风控拦截了此房间）"
-        } else if msg.contains("请求") || msg.contains("非 JSON") {
-            "（网络异常或抖音风控拦截，请稍后重试）"
-        } else {
-            "（请检查房间号或网络）"
-        };
-        return Err(format!("解析直播流地址失败：{} {}", msg, hint));
+        return Err(e);
     }
 
     // 二次校验：解析成功也确保 stream_url 字段被实际写入了
@@ -407,7 +397,7 @@ async fn resolve_room_stream_if_needed(
 }
 
 /// 执行解析并将结果回写到房间配置
-/// 
+///
 /// 关键：加 6 秒超时。抖音 Webcast API 经常慢/限流，不超时会导致「开始录制」卡死。
 async fn do_resolve_and_save(
     url_to_resolve: &str,
@@ -419,13 +409,16 @@ async fn do_resolve_and_save(
     let resolved = match tokio::time::timeout(std::time::Duration::from_secs(6), resolve_future).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            return Err(format!(
-                "自动解析直播流地址失败：{}。请确认主播正在直播，或手动填写 flv/hls 流地址。",
-                e
-            ));
+            // resolve() 现在自带详细错误（每个策略失败原因），不再二次包装
+            return Err(format!("{}", e));
         }
         Err(_) => {
-            return Err("解析直播流地址超时（6 秒），请检查网络或稍后重试".into());
+            return Err(format!(
+                "解析直播流地址超时（6 秒），房间 {}。\n\
+                 网络较慢或抖音风控拦截，请稍后重试。\n\
+                 提示：也可在房间设置里手动粘贴 flv/hls 流地址。",
+                room_id
+            ));
         }
     };
     let mut st = state.lock().unwrap();
