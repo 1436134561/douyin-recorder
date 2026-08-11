@@ -61,9 +61,23 @@ jobs:
         run: |
           $ff = "ffmpeg"
           if (!(Test-Path $ff)) { New-Item -ItemType Directory -Path $ff }
-          # 下载 ffmpeg essentials 构建（含 libx264/mp3 等常用编码器）
-          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-          Invoke-WebRequest -Uri $url -OutFile ff.zip
+          # 下载 ffmpeg（双源 fallback：gyan.dev 偶发不可达 → 自动换 GitHub BtbN 构建）
+          $urls = @(
+            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          )
+          $downloaded = $false
+          foreach ($url in $urls) {
+            try {
+              Write-Host "尝试下载 ffmpeg: $url"
+              Invoke-WebRequest -Uri $url -OutFile ff.zip -UseBasicParsing -TimeoutSec 300
+              if ((Get-Item ff.zip).Length -gt 10MB) { $downloaded = $true; break }
+              Write-Host "文件太小，疑似错误页，尝试下一源"
+            } catch {
+              Write-Host "下载失败: $url -> $($_.Exception.Message)"
+            }
+          }
+          if (-not $downloaded) { throw "所有 ffmpeg 下载源均失败" }
           Expand-Archive -Force ff.zip -DestinationPath ff_tmp
           # 取 bin/ffmpeg.exe 放到 ffmpeg/ffmpeg.exe（与 exe 同级的 resources 捆绑）
           $bin = Get-ChildItem ff_tmp -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
