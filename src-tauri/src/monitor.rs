@@ -7,7 +7,7 @@
 //! - LiveProbe 复用 reqwest client + ttwid cookie，避免每轮重新注册触发风控。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;

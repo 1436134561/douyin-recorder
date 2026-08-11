@@ -304,6 +304,7 @@ fn start_ffmpeg(
         let mut cmd = Command::new(ffmpeg_executable());
         cmd.args([
             "-y",
+            "-v", "info",  // 详细日志：能看到 HTTP 403/网络错误等真实失败原因
             "-i",
             &url,
             "-c",
@@ -334,6 +335,7 @@ fn start_ffmpeg(
         let mut cmd = Command::new(ffmpeg_executable());
         cmd.args([
             "-y",
+            "-v", "info",
             "-f",
             "gdigrab",
             "-framerate",
@@ -354,14 +356,17 @@ fn start_ffmpeg(
         spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 屏幕录制启动失败: {}", e))?
     };
 
-    // 启动后台线程读 stderr（限前 4KB），失败时放进错误文案告诉用户真实原因
-    let stderr_buf = capture_stderr(child.stderr.take());
+    // 关键修复：不用后台线程 + Arc<Mutex>，避免竞态。
+    // 直接 take stderr 句柄保留；等 ffmpeg 退出后同步排空（管道已关闭，read_to_end 立即返回）
+    let stderr_handle: Option<std::process::ChildStderr> = child.stderr.take();
 
-    // 启动后短暂等待，验证 ffmpeg 是否异常退出（仅非 0 退出码视为失败）
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    // 启动后等待 ffmpeg 连接流（流地址解析/握手可能慢；2 秒比之前 0.6 秒更宽裕）
+    std::thread::sleep(std::time::Duration::from_millis(2000));
     if let Ok(Some(status)) = child.try_wait() {
         if !status.success() {
-            return Err(ffmpeg_exit_error(&read_stderr(&stderr_buf), status.code(), 0, mode));
+            // 同步排空 stderr（管道已随进程退出而关闭，read_to_end 立即返回所有数据）
+            let stderr = drain_stderr(stderr_handle);
+            return Err(ffmpeg_exit_error(&stderr, status.code(), 2, mode));
         }
     }
 
@@ -376,9 +381,11 @@ fn start_ffmpeg(
     if !has_data {
         if let Ok(Some(status)) = child.try_wait() {
             if !status.success() {
-                return Err(ffmpeg_exit_error(&read_stderr(&stderr_buf), status.code(), 4, mode));
+                let stderr = drain_stderr(stderr_handle);
+                return Err(ffmpeg_exit_error(&stderr, status.code(), 5, mode));
             }
         }
+        let stderr = drain_stderr(stderr_handle);
         return Err(anyhow!(
             "开始录制 {} 秒后仍未收到数据。\n\
              可能原因：\n\
@@ -388,10 +395,13 @@ fn start_ffmpeg(
              \n\
              请确认直播间正在直播，并重新开始录制。\n\
              \nffmpeg stderr 尾部：\n{}",
-            4,
-            read_stderr(&stderr_buf)
+            5,
+            stderr
         ));
     }
+
+    // 一切正常：丢弃 stderr 句柄，让 child 句柄继续持有（后续杀进程会清理）
+    drop(stderr_handle);
 
     Ok(RecordingSession {
         room_id: room_id.to_string(),
@@ -402,39 +412,30 @@ fn start_ffmpeg(
     })
 }
 
-/// 后台读 ffmpeg stderr，保留最近 4KB（Vec<u8> + Mutex + 截断）
-fn capture_stderr(stderr: Option<std::process::ChildStderr>) -> Arc<Mutex<Vec<u8>>> {
-    let buf = Arc::new(Mutex::new(Vec::with_capacity(4096)));
-    if let Some(mut s) = stderr {
-        let buf_clone = buf.clone();
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut tmp = [0u8; 1024];
-            loop {
-                match s.read(&mut tmp) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let mut b = buf_clone.lock().unwrap();
-                        if b.len() < 4096 {
-                            let room = 4096 - b.len();
-                            b.extend_from_slice(&tmp[..n.min(room)]);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+/// 同步排空 ffmpeg stderr（管道随子进程退出已关闭，read_to_end 立即返回所有数据）
+/// 避免后台线程 + Arc<Mutex> 的竞态：之前 read_stderr 可能在后台线程读完前调用，
+/// 导致只能看到 banner 而看不到真正的错误信息。
+fn drain_stderr(stderr: Option<std::process::ChildStderr>) -> String {
+    use std::io::Read;
+    let mut s = match stderr {
+        Some(s) => s,
+        None => return String::from("（stderr 未捕获）"),
+    };
+    let mut buf = Vec::with_capacity(2048);
+    match (&mut s).take(8 * 1024).read_to_end(&mut buf) {
+        Ok(_) => {}
+        Err(_) => {
+            // 退路：best-effort
+            let _ = s.read_to_end(&mut buf);
+        }
     }
-    buf
-}
-
-/// 取 stderr buffer 内容的可读字符串（截断到 1KB 用于错误消息）
-fn read_stderr(buf: &Mutex<Vec<u8>>) -> String {
-    let bytes = buf.lock().unwrap();
-    if bytes.is_empty() {
-        return String::from("（stderr 无输出）");
+    if buf.is_empty() {
+        return String::from("（stderr 无输出，可能 ffmpeg 被外部进程强制终止，如杀毒软件）");
     }
-    String::from_utf8_lossy(&bytes).chars().take(1024).collect()
+    String::from_utf8_lossy(&buf)
+        .chars()
+        .take(1500) // 略放宽，可见更多上下文
+        .collect()
 }
 
 /// 生成 ffmpeg 退出错误（包含十六进制退出码 + stderr 尾部 + 分类提示）
