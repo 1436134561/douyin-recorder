@@ -61,10 +61,12 @@ jobs:
         run: |
           $ff = "ffmpeg"
           if (!(Test-Path $ff)) { New-Item -ItemType Directory -Path $ff }
-          # 下载 ffmpeg（双源 fallback：gyan.dev 偶发不可达 → 自动换 GitHub BtbN 构建）
+          # 下载 ffmpeg（BtbN 主源 + gyan.dev fallback）
+          # BtbN/FFmpeg-Builds 走 github.com 下载更稳，且 GPL win64-gpl 含 libx264
+          # gyan.dev essentials 作 fallback（曾因偶发不可达导致构建失败）
           $urls = @(
-            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
           )
           $downloaded = $false
           foreach ($url in $urls) {

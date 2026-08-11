@@ -439,6 +439,13 @@ fn drain_stderr(stderr: Option<std::process::ChildStderr>) -> String {
 }
 
 /// 生成 ffmpeg 退出错误（包含十六进制退出码 + stderr 尾部 + 分类提示）
+///
+/// 异常退出码识别（用户实测反馈后加入）：
+/// - 0xABxxxxxx 模式（如 0xABAFB008）：ffmpeg 自己不会返回这种值，这是 Windows
+///   调试堆填充模式 + 进程被外力 kill（杀毒软件 / Windows Defender / EDR / 调试器）后的特征。
+///   stderr 只有 banner 没有错误消息也是同一信号。
+/// - 高位 0xC000000x：Windows 异常码（如 0xC0000005 access violation / 0xC0000409 stack overflow）
+/// - 其他常见：1（普通错误）、-1（无法获取）
 fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &str) -> anyhow::Error {
     let c = code.unwrap_or(-1);
     let hex = if c >= 0 {
@@ -447,8 +454,25 @@ fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &s
         format!("0x{:08X} (signed: {})", c as u32, c)
     };
 
-    // 根据 stderr 内容分类提示
-    let hint = if stderr.contains("403") || stderr.contains("Forbidden") {
+    // 异常退出码/空 stderr 检测 —— 强烈指向杀毒软件 / Windows Defender
+    let abnormal_code = c == -1414549496  // 0xABAFB008
+        || c == -1414549419              // 0xABABABAB
+        || (c > 0 && (c as u32 & 0xFF000000) == 0xAB000000)
+        || (c > 0 && (c as u32 & 0xFFFF0000) == 0xC0000000);
+    let empty_stderr = stderr.is_empty()
+        || stderr.contains("stderr 无输出")
+        || stderr.contains("stderr 未捕获");
+
+    // 分类提示（按优先级：abnormal_code > empty_stderr > 关键词）
+    let hint = if abnormal_code && empty_stderr {
+        // 🚨 最关键的诊断信号：异常退出码 + 空 stderr
+        "🚨 高度疑似被杀毒软件 / Windows Defender 拦截：\n\
+         · ffmpeg 启动 banner 输出后立即被杀（stderr 无错误消息说明不是 ffmpeg 自己崩）\n\
+         · 异常退出码 0xABxxxxxx 是 Windows 调试堆填充 + 进程被外力 kill 的特征\n\
+         · 修复方法：把 ffmpeg.exe 和本程序加入 Windows Defender 排除项（白名单）\n\
+         · 或临时关闭实时保护验证（设 → 病毒防护 → 管理设置 → 实时保护 关）\n\
+         · 参考：https://support.microsoft.com/zh-cn/windows/添加排除项"
+    } else if stderr.contains("403") || stderr.contains("Forbidden") {
         "（最可能：流地址已过期，HTTP 403。请重新开始录制，会自动重新解析）"
     } else if stderr.contains("Connection refused") || stderr.contains("timeout") || stderr.contains("timed out") {
         "（最可能：网络不可达 — 防火墙/代理/抖音风控）"
@@ -465,7 +489,8 @@ fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &s
          排查方向：\n\
          ① 流地址已过期（抖音 flv URL 几分钟就失效，重新开始录制会自动重新解析）\n\
          ② 主播未在直播或被风控拦截\n\
-         ③ ffmpeg 找不到或缺少编解码器\n\
+         ③ 杀毒软件 / Windows Defender 把 ffmpeg.exe 当作可疑进程杀掉（最常见）\n\
+         ④ ffmpeg 找不到或缺少编解码器\n\
          \n\
          ffmpeg stderr 尾部：\n{}",
         waited_secs,
