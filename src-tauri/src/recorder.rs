@@ -294,6 +294,18 @@ fn start_ffmpeg(
     std::fs::create_dir_all(&work)?;
 
     let mode = decide_mode(cfg, room);
+    let ffmpeg_bin = ffmpeg_executable();
+    // 关键修复：把 child 工作目录设为 ffmpeg.exe 所在目录。
+    // mingw 编译的 ffmpeg（gyan.dev essentials / BtbN nightly）依赖同目录的
+    // gnuwin32 runtime DLL。如果 spawn 时 cwd 不在 ffmpeg 同目录，
+    // DLL 加载阶段就异常退出（exit code 0xABAFB008 这种异常值，stderr 只有 banner）。
+    // 用户实测：cmd 里 cd 到 ffmpeg 同目录手动跑 -version 完全正常，
+    // 但应用 spawn 后立即崩——100% 是这个 working dir 问题。
+    let ffmpeg_dir = std::path::Path::new(&ffmpeg_bin)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
     let mut child = if mode == "stream" {
         let url = room
             .and_then(|r| r.stream_url.clone())
@@ -301,8 +313,9 @@ fn start_ffmpeg(
             .ok_or_else(|| anyhow!("房间 {} 未配置直播流地址", room_id))?;
         let seg_time = cfg.segment_minutes.max(1) * 60;
         let out_tmpl = work.join("seg_%03d.flv");
-        let mut cmd = Command::new(ffmpeg_executable());
-        cmd.args([
+        let mut cmd = Command::new(&ffmpeg_bin);
+        cmd.current_dir(&ffmpeg_dir)
+            .args([
             "-y",
             "-v", "info",  // 详细日志：能看到 HTTP 403/网络错误等真实失败原因
             "-i",
@@ -332,8 +345,9 @@ fn start_ffmpeg(
     } else {
         let src = cfg.screen_source.clone().unwrap_or_else(|| "desktop".into());
         let out_file = work.join("rec.mp4");
-        let mut cmd = Command::new(ffmpeg_executable());
-        cmd.args([
+        let mut cmd = Command::new(&ffmpeg_bin);
+        cmd.current_dir(&ffmpeg_dir)
+            .args([
             "-y",
             "-v", "info",
             "-f",
