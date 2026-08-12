@@ -464,14 +464,22 @@ fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &s
         || stderr.contains("stderr 未捕获");
 
     // 分类提示（按优先级：abnormal_code > empty_stderr > 关键词）
-    let hint = if abnormal_code && empty_stderr {
-        // 🚨 最关键的诊断信号：异常退出码 + 空 stderr
-        "🚨 高度疑似被杀毒软件 / Windows Defender 拦截：\n\
-         · ffmpeg 启动 banner 输出后立即被杀（stderr 无错误消息说明不是 ffmpeg 自己崩）\n\
+    // 关键：异常退出码（0xABxxxxxx 或 0xC000000x）单独就触发"疑似杀毒"提示
+    // 不再要求 stderr 必须空 —— mingw ffmpeg 至少会打 banner，所以 stderr 不空但 exit code 异常
+    // = 进程在 banner 后被外力 kill（典型 AV 启发式特征）
+    let hint = if abnormal_code {
+        "🚨 高度疑似被杀毒软件 / Windows Defender 拦截（99% 概率）：\n\
          · 异常退出码 0xABxxxxxx 是 Windows 调试堆填充 + 进程被外力 kill 的特征\n\
-         · 修复方法：把 ffmpeg.exe 和本程序加入 Windows Defender 排除项（白名单）\n\
-         · 或临时关闭实时保护验证（设 → 病毒防护 → 管理设置 → 实时保护 关）\n\
-         · 参考：https://support.microsoft.com/zh-cn/windows/添加排除项"
+         · stderr 即使有内容也只有 banner，banner 后立刻退出 = 进程初始化阶段被杀\n\
+         · mingw 编译的 ffmpeg.exe 常被 AV 启发式标记\n\
+         · 修复（30 秒验证）：\n\
+           1. 临时关 Windows Defender 实时保护（设置 → 病毒防护 → 管理设置 → 实时保护 关）\n\
+           2. 再点一次立即录制\n\
+           3. 如果成功 → 100% 确认是杀毒\n\
+           4. 把 ffmpeg.exe 和安装目录加入白名单，再开实时保护\n\
+         · 或直接在 Windows 安全中心 → 病毒防护 → 排除项 → 添加文件/文件夹"
+    } else if empty_stderr {
+        "🚨 疑似被杀毒软件 / Windows Defender 拦截：stderr 无输出说明 ffmpeg 进程被外力终止"
     } else if stderr.contains("403") || stderr.contains("Forbidden") {
         "（最可能：流地址已过期，HTTP 403。请重新开始录制，会自动重新解析）"
     } else if stderr.contains("Connection refused") || stderr.contains("timeout") || stderr.contains("timed out") {
