@@ -443,20 +443,43 @@ fn quote_win_arg(a: &str) -> String {
 
 /// 读取 ffmpeg stderr 日志文件（截断展示，含提示）
 ///
-/// 用 read_to_end 拿 bytes + from_utf8_lossy 容错解码，避免 ffmpeg stderr 含
-/// 非 UTF-8 字节（如 GBK/二进制进度）时整个文件读不到。
+/// 中文 Windows 默认 GBK 编码，ffmpeg 输出含路径等可能有 GBK 字节。
+/// 解码策略：先 UTF-8 容错（from_utf8_lossy），如果替换字符（U+FFFD）比例 > 3%，
+/// 说明不是 UTF-8，回退用 GBK 解码（覆盖绝大多数中文 Windows 场景）。
 fn read_stderr_file(log: &std::path::Path) -> String {
     let bytes = match std::fs::read(log) {
         Ok(b) => b,
-        Err(e) => return format!("（读取 stderr 日志失败: {}）", e),
+        Err(e) => {
+            return format!(
+                "（读取 stderr 日志失败: {}，路径: {}，请用记事本打开此文件查看真实错误）",
+                e,
+                log.display()
+            );
+        }
     };
     if bytes.is_empty() {
         return String::from("（stderr 日志为空）");
     }
-    // 尝试 UTF-8 解码（容错），无效字节用 U+FFFD 替代
-    let text = String::from_utf8_lossy(&bytes);
-    let mut t = text.into_owned();
-    // 截断到 ~2KB（按字符数，避免截到 UTF-8 字节中间）
+
+    // 1. 先尝试 UTF-8 容错解码
+    let utf8_text = String::from_utf8_lossy(&bytes);
+    let replacement_count = utf8_text.chars().filter(|c| *c == '\u{FFFD}').count();
+    let total = utf8_text.chars().count().max(1);
+
+    // 2. 替换字符 >3% 视为非 UTF-8 → 改用 GBK 解码
+    let text = if replacement_count * 100 / total > 3 {
+        let (decoded, _encoding, had_errors) = encoding_rs::GBK.decode(&bytes);
+        if had_errors {
+            utf8_text.into_owned()
+        } else {
+            decoded.into_owned()
+        }
+    } else {
+        utf8_text.into_owned()
+    };
+
+    // 截断到 ~2KB（按字符数）
+    let mut t = text;
     if t.chars().count() > 2000 {
         t = t.chars().take(2000).collect::<String>();
         t.push_str("\n...（截断）");

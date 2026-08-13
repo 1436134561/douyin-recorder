@@ -321,6 +321,16 @@ async fn fetch_webcast_api(
         return Err(anyhow!("API 返回错误({}): {} (主播可能未在直播)", status_code, msg));
     }
 
+    // 关键：检查房间真实状态（status_code=0 只表示 API 调用成功，房间可能未开播）
+    // 抖音房间 status: 2=直播中, 4=未开播/已下播
+    if let Some(room) = data.get("data").and_then(|d| d.get("data")).and_then(|d| d.as_array()).and_then(|a| a.first()) {
+        if let Some(room_status) = room.get("status").and_then(|v| v.as_i64()) {
+            if room_status == 4 {
+                return Err(anyhow!("主播未开播（房间 {} 当前未在直播或已下播）", web_rid));
+            }
+        }
+    }
+
     // 提取元数据
     let meta = extract_meta_from_api(&data);
 
