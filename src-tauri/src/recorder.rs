@@ -442,20 +442,26 @@ fn quote_win_arg(a: &str) -> String {
 }
 
 /// 读取 ffmpeg stderr 日志文件（截断展示，含提示）
+///
+/// 用 read_to_end 拿 bytes + from_utf8_lossy 容错解码，避免 ffmpeg stderr 含
+/// 非 UTF-8 字节（如 GBK/二进制进度）时整个文件读不到。
 fn read_stderr_file(log: &std::path::Path) -> String {
-    match std::fs::read_to_string(log) {
-        Ok(s) if !s.trim().is_empty() => {
-            let mut t = s;
-            // 截断到 ~2KB
-            if t.chars().count() > 2000 {
-                t = t.chars().take(2000).collect::<String>();
-                t.push_str("\n...（截断）");
-            }
-            t
-        }
-        Ok(_) => String::from("（stderr 日志为空）"),
-        Err(e) => format!("（读取 stderr 日志失败: {}）", e),
+    let bytes = match std::fs::read(log) {
+        Ok(b) => b,
+        Err(e) => return format!("（读取 stderr 日志失败: {}）", e),
+    };
+    if bytes.is_empty() {
+        return String::from("（stderr 日志为空）");
     }
+    // 尝试 UTF-8 解码（容错），无效字节用 U+FFFD 替代
+    let text = String::from_utf8_lossy(&bytes);
+    let mut t = text.into_owned();
+    // 截断到 ~2KB（按字符数，避免截到 UTF-8 字节中间）
+    if t.chars().count() > 2000 {
+        t = t.chars().take(2000).collect::<String>();
+        t.push_str("\n...（截断）");
+    }
+    t
 }
 
 /// 生成 ffmpeg 退出错误（包含十六进制退出码 + stderr 尾部 + 分类提示）
