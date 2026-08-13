@@ -1,0 +1,5 @@
+requests>=2.31
+pillow>=10.0
+pystray>=0.19
+pywebview>=6.2.1
+imageio-ffmpeg>=0.5

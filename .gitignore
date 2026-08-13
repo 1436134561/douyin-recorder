@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 构建产物
+build/
+build_v39/
+dist/
+dist_v39/
+*.spec.bak
+
+# 打包/二进制
+*.zip
+*.exe
+*.7z
+
+# 本地配置（含用户隐私设置）
+config.json
+
+# 会话记录（内部工作文件，不入库）
+_CONTEXT.md
+_continue_conversation.md
+_t/
+_build_log*.txt
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db

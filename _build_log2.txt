@@ -1,0 +1,117 @@
+46 DEPRECATION: Running PyInstaller as admin is not necessary nor sensible. Run PyInstaller from a non-administrator terminal. PyInstaller 7.0 will block this.
+112 INFO: PyInstaller: 6.21.0, contrib hooks: 2026.6
+112 INFO: Python: 3.13.14
+138 INFO: Platform: Windows-10-10.0.19045-SP0
+138 INFO: Python environment: c:\Users\admin\.workbuddy\binaries\python\envs\dyrec
+141 INFO: Module search paths (PYTHONPATH):
+['C:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Scripts\\pyinstaller.exe',
+ 'D:\\ARJ\\workbuddy\\resources\\app.asar.unpacked\\cli\\vendor\\shim',
+ 'C:\\Users\\admin\\.workbuddy\\binaries\\python\\versions\\3.13.12\\python313.zip',
+ 'C:\\Users\\admin\\.workbuddy\\binaries\\python\\versions\\3.13.12\\DLLs',
+ 'C:\\Users\\admin\\.workbuddy\\binaries\\python\\versions\\3.13.12\\Lib',
+ 'C:\\Users\\admin\\.workbuddy\\binaries\\python\\versions\\3.13.12',
+ 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec',
+ 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages',
+ 'C:\\Users\\admin\\WorkBuddy\\2026-07-20-21-22-14\\douyin_recorder']
+409 INFO: Appending 'binaries' from .spec
+409 INFO: Appending 'datas' from .spec
+409 INFO: checking Analysis
+410 INFO: Building Analysis because Analysis-00.toc is non existent
+410 INFO: Looking for Python shared library...
+410 INFO: Using Python shared library: C:\Users\admin\.workbuddy\binaries\python\versions\3.13.12\python313.dll
+410 INFO: Running Analysis Analysis-00.toc
+410 INFO: Target bytecode optimization level: 0
+410 INFO: Initializing module dependency graph...
+410 INFO: Initializing module graph hook caches...
+421 INFO: Analyzing modules for base_library.zip ...
+1125 INFO: Processing standard module hook 'hook-math.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+1410 INFO: Processing standard module hook 'hook-encodings.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+1890 INFO: Processing standard module hook 'hook-heapq.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+2719 INFO: Processing standard module hook 'hook-pickle.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+3687 INFO: Caching module dependency graph...
+3711 INFO: Analyzing C:\Users\admin\WorkBuddy\2026-07-20-21-22-14\douyin_recorder\main.py
+3750 INFO: Processing standard module hook 'hook-PIL.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+3832 INFO: Processing standard module hook 'hook-PIL.Image.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+4137 INFO: Processing standard module hook 'hook-xml.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+4152 INFO: Processing standard module hook 'hook-xml.etree.cElementTree.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+4299 INFO: Processing standard module hook 'hook-PIL.ImageFilter.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+4479 INFO: Processing standard module hook 'hook-imageio_ffmpeg.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+4507 INFO: Processing standard module hook 'hook-platform.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+4547 INFO: Processing standard module hook 'hook-sysconfig.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+4550 INFO: Processing standard module hook 'hook-_ctypes.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+4803 INFO: Processing standard module hook 'hook-urllib3.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+4876 INFO: Processing pre-safe-import-module hook 'hook-backports.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+4877 INFO: SetuptoolsInfo: initializing cached setuptools info...
+5259 INFO: Setuptools: 'backports' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.backports'!
+5264 INFO: Processing standard module hook 'hook-setuptools.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+5273 INFO: Processing pre-safe-import-module hook 'hook-distutils.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+5295 INFO: Processing pre-safe-import-module hook 'hook-jaraco.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+5295 INFO: Setuptools: 'jaraco' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.jaraco'!
+5303 INFO: Processing pre-safe-import-module hook 'hook-more_itertools.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+5303 INFO: Setuptools: 'more_itertools' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.more_itertools'!
+5414 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+5603 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+6196 INFO: Processing pre-safe-import-module hook 'hook-packaging.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+6351 INFO: Processing standard module hook 'hook-setuptools._vendor.jaraco.text.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+6352 INFO: Processing pre-safe-import-module hook 'hook-importlib_resources.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+6653 INFO: Processing pre-safe-import-module hook 'hook-tomli.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+6653 INFO: Setuptools: 'tomli' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.tomli'!
+7022 INFO: Processing pre-safe-import-module hook 'hook-wheel.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+7022 INFO: Setuptools: 'wheel' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.wheel'!
+7314 INFO: Processing standard module hook 'hook-certifi.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+7353 INFO: Processing standard module hook 'hook-charset_normalizer.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+7476 INFO: Processing standard module hook 'hook-pystray.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+7745 INFO: Processing pre-safe-import-module hook 'hook-six.moves.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+7826 INFO: Processing pre-safe-import-module hook 'hook-gi.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+7935 INFO: Processing standard module hook 'hook-webview.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\webview\\__pyinstaller'
+8101 INFO: Processing standard module hook 'hook-webbrowser.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+8461 INFO: Processing standard module hook 'hook-clr.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\pythonnet\\_pyinstaller'
+8502 INFO: Processing standard module hook 'hook-clr_loader.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+8580 INFO: Processing standard module hook 'hook-pycparser.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+9094 INFO: Processing standard module hook 'hook-difflib.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+9390 INFO: Processing pre-find-module-path hook 'hook-tkinter.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+9390 INFO: TclTkInfo: initializing cached Tcl/Tk info...
+9682 INFO: Processing standard module hook 'hook-_tkinter.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+9692 INFO: Processing module hooks (post-graph stage)...
+9693 WARNING: Hidden import "pycparser.lextab" not found!
+9693 WARNING: Hidden import "pycparser.yacctab" not found!
+9912 INFO: Processing standard module hook 'hook-PIL.SpiderImagePlugin.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+10001 INFO: Processing standard module hook 'hook-_tkinter.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks'
+10011 INFO: Performing binary vs. data reclassification (1047 entries)
+10083 INFO: Looking for ctypes DLLs
+10124 INFO: Analyzing run-time hooks ...
+10126 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+10128 INFO: Including run-time hook 'pyi_rth_setuptools.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+10129 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+10131 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+10132 INFO: Including run-time hook 'pyi_rth__tkinter.py' from 'c:\\Users\\admin\\.workbuddy\\binaries\\python\\envs\\dyrec\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+10152 INFO: Creating base_library.zip...
+10167 INFO: Looking for dynamic libraries
+10611 INFO: Extra DLL search directories (AddDllDirectory): []
+10611 INFO: Extra DLL search directories (PATH): []
+11066 INFO: Warnings written to C:\Users\admin\WorkBuddy\2026-07-20-21-22-14\douyin_recorder\build\build\warn-build.txt
+11100 INFO: Graph cross-reference written to C:\Users\admin\WorkBuddy\2026-07-20-21-22-14\douyin_recorder\build\build\xref-build.html
+11131 INFO: checking PYZ
+11131 INFO: Building PYZ because PYZ-00.toc is non existent
+11132 INFO: Building PYZ (ZlibArchive) C:\Users\admin\WorkBuddy\2026-07-20-21-22-14\douyin_recorder\build\build\PYZ-00.pyz
+11621 INFO: Building PYZ (ZlibArchive) C:\Users\admin\WorkBuddy\2026-07-20-21-22-14\douyin_recorder\build\build\PYZ-00.pyz completed successfully.
+11632 INFO: checking PKG
+11632 INFO: Building PKG because PKG-00.toc is non existent
+11632 INFO: Building PKG (CArchive) DouyinRecorder.pkg
+11646 INFO: Building PKG (CArchive) DouyinRecorder.pkg completed successfully.
+11647 INFO: Bootloader c:\Users\admin\.workbuddy\binaries\python\envs\dyrec\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+11647 INFO: checking EXE
+11647 INFO: Building EXE because EXE-00.toc is non existent
+11647 INFO: Building EXE from EXE-00.toc
+11647 INFO: Copying bootloader EXE to C:\Users\admin\WorkBuddy\2026-07-20-21-22-14\douyin_recorder\build\build\DouyinRecorder.exe
+11650 INFO: Copying icon to EXE
+11652 INFO: Copying 0 resources to EXE
+11652 INFO: Embedding manifest in EXE
+11655 INFO: Appending PKG archive to EXE
+11657 INFO: Fixing EXE headers
+11703 INFO: Building EXE from EXE-00.toc completed successfully.
+11710 INFO: checking COLLECT
+11710 INFO: Building COLLECT because COLLECT-00.toc is non existent
+11710 INFO: Building COLLECT COLLECT-00.toc
+12451 INFO: Building COLLECT COLLECT-00.toc completed successfully.
+12465 INFO: Build complete! The results are available in: C:\Users\admin\WorkBuddy\2026-07-20-21-22-14\douyin_recorder\dist

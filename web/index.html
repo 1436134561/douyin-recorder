@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DouyinRecorder · 抖音直播录屏</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <span class="title">DouyinRecorder</span>
+      <span class="ver" id="ver">v3.9</span>
+    </div>
+    <div class="addbox">
+      <input id="addInput" type="text" placeholder="粘贴直播间链接或房间号…" />
+      <button id="addBtn" class="btn primary">添加</button>
+    </div>
+    <div class="actions">
+      <button class="btn" id="startAllBtn">全部开始</button>
+      <button class="btn" id="stopAllBtn">全部停止</button>
+      <button class="btn" id="openFolderBtn">打开目录</button>
+      <button class="btn" id="batchBtn">批量</button>
+      <button class="btn" id="mergeBtn">合并</button>
+      <button class="btn" id="recBtn">已完成录屏</button>
+      <button class="btn" id="settingsBtn">设置</button>
+      <button class="btn icon" id="themeBtn" title="主题">◐</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="cards" class="cards"></section>
+    <p id="emptyHint" class="empty-hint">还没有任务，粘贴直播间链接开始监控。</p>
+  </main>
+
+  <!-- 日志抽屉 -->
+  <button class="log-toggle" id="logToggle">日志</button>
+  <aside class="log-drawer" id="logDrawer">
+    <div class="log-head"><span>运行日志</span><button class="btn icon" id="logClose">×</button></div>
+    <div class="log-body" id="logBody"></div>
+  </aside>
+
+  <!-- 设置弹窗 -->
+  <div class="modal" id="settingsModal" hidden>
+    <div class="modal-card">
+      <div class="modal-head"><span>设置</span><button class="btn icon" data-close>×</button></div>
+      <div class="modal-body">
+        <h3>输出</h3>
+        <label>输出目录 <input id="cfg_output_dir" type="text" /></label>
+        <button class="btn small" id="pickOutBtn">选择…</button>
+        <label>文件名模板 <input id="cfg_filename_template" type="text" placeholder="{name}_{time}" /></label>
+
+        <h3>智能识别</h3>
+        <label class="row"><input id="cfg_smart_record" type="checkbox" /> 启用智能识别（命中才录）</label>
+        <label>模式
+          <select id="cfg_smart_mode">
+            <option value="posture">posture（站立才录/坐下停）</option>
+            <option value="motion">motion（运动才录）</option>
+            <option value="person">person（有人即录）</option>
+          </select>
+        </label>
+        <label>采样间隔(秒) <input id="cfg_smart_interval" type="number" step="0.5" min="0.5" max="5" /></label>
+        <label>运动阈值(%) <input id="cfg_smart_motion_threshold" type="number" step="0.1" /></label>
+        <label>posture 跨度(0-1) <input id="cfg_smart_posture_span" type="number" step="0.01" min="0" max="1" /></label>
+        <label>posture 底部比(0-1) <input id="cfg_smart_posture_bottom_ratio" type="number" step="0.01" min="0" max="1" /></label>
+
+        <h3>调度与资源</h3>
+        <label>离线检测间隔(秒) <input id="cfg_check_offline_interval" type="number" step="10" /></label>
+        <label class="row"><input id="cfg_low_resource" type="checkbox" /> 低资源模式（单线程/小缓冲）</label>
+
+        <h3>自动转码</h3>
+        <label class="row"><input id="cfg_auto_transcode" type="checkbox" /> 录制后自动转码</label>
+        <label>格式
+          <select id="cfg_transcode_format"><option>mp4</option><option>mov</option><option>mkv</option><option>ts</option></select>
+        </label>
+        <label>方式
+          <select id="cfg_transcode_mode"><option value="copy">流拷贝(快)</option><option value="recode">重编码(兼容)</option></select>
+        </label>
+        <label class="row"><input id="cfg_transcode_delete_src" type="checkbox" /> 转码后删除原文件</label>
+
+        <h3>其它</h3>
+        <label>Cookie <input id="cfg_cookie" type="text" placeholder="ttwid=…" /></label>
+        <label>代理 <input id="cfg_proxy" type="text" placeholder="http://host:port" /></label>
+        <label class="row"><input id="cfg_startup_auto_launch" type="checkbox" /> 开机自启动</label>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" data-close>取消</button>
+        <button class="btn primary" id="saveCfgBtn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 批量导入 -->
+  <div class="modal" id="batchModal" hidden>
+    <div class="modal-card">
+      <div class="modal-head"><span>批量导入</span><button class="btn icon" data-close>×</button></div>
+      <div class="modal-body">
+        <p class="hint">每行一个直播间链接或房间号；也可从 .txt 导入。</p>
+        <textarea id="batchText" rows="10" placeholder="https://live.douyin.com/123&#10;456789"></textarea>
+        <div class="row">
+          <button class="btn small" id="batchLoadBtn">从文件导入</button>
+          <button class="btn small" id="batchImportBtn">导入</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 合并 -->
+  <div class="modal" id="mergeModal" hidden>
+    <div class="modal-card">
+      <div class="modal-head"><span>合并视频</span><button class="btn icon" data-close>×</button></div>
+      <div class="modal-body">
+        <button class="btn small" id="mergePickBtn">选择文件…</button>
+        <ul id="mergeList" class="filelist"></ul>
+        <label>格式 <select id="mergeFmt"><option>mp4</option><option>mov</option><option>mkv</option><option>ts</option></select></label>
+        <label>方式 <select id="mergeMode"><option value="copy">流拷贝</option><option value="recode">重编码</option></select></label>
+        <label class="row"><input id="mergeLow" type="checkbox" /> 低资源</label>
+        <div id="mergeMsg" class="hint"></div>
+      </div>
+      <div class="modal-foot"><button class="btn primary" id="mergeRunBtn">开始合并</button></div>
+    </div>
+  </div>
+
+  <!-- 已完成录屏 / 剪辑 -->
+  <div class="modal" id="recModal" hidden>
+    <div class="modal-card wide">
+      <div class="modal-head"><span>已完成录屏</span><button class="btn icon" data-close>×</button></div>
+      <div class="modal-body">
+        <ul id="recList" class="filelist"></ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- 剪辑 -->
+  <div class="modal" id="clipModal" hidden>
+    <div class="modal-card wide">
+      <div class="modal-head"><span>预览与剪辑</span><button class="btn icon" data-close>×</button></div>
+      <div class="modal-body">
+        <video id="clipVideo" controls></video>
+        <div class="clip-controls">
+          <button class="btn small" id="markStartBtn">标记起点</button>
+          <button class="btn small" id="markEndBtn">标记终点</button>
+          <span id="clipCur" class="hint"></span>
+        </div>
+        <ul id="clipSegs" class="filelist"></ul>
+        <div id="clipMsg" class="hint"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" data-close>关闭</button>
+        <button class="btn primary" id="clipExportBtn">导出选中片段</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 实时预览 -->
+  <div class="modal" id="previewModal" hidden>
+    <div class="modal-card">
+      <div class="modal-head"><span>实时预览</span><button class="btn icon" data-close>×</button></div>
+      <div class="modal-body center">
+        <img id="previewImg" alt="loading…" />
+      </div>
+    </div>
+  </div>
+
+  <!-- 全局提示 -->
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
