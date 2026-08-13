@@ -325,7 +325,9 @@ fn start_ffmpeg(
             "-segment_time".into(), seg_time.to_string(),
             "-segment_format".into(), "flv".into(),
             "-reset_timestamps".into(), "1".into(),
-            "-vsync".into(), "0".into(),
+            // 移除了 -vsync 0：① 对 -c copy 模式无意义（不重新编解码） ② 部分精简版 ffmpeg
+            // 不支持 -vsync（用户实测：Unrecognized option 'vsync'），导致 ffmpeg 解析 args
+            // 立即报错退出（exit 1），stderr 被截断后看起来像"启动后秒退 + 异常码"
             "-reconnect".into(), "1".into(),
             "-reconnect_streamed".into(), "1".into(),
             "-reconnect_delay_max".into(), "5".into(),
@@ -365,7 +367,18 @@ fn start_ffmpeg(
             })?,
         ));
     let mut child = spawn_hidden(&mut cmd)
-        .map_err(|e| anyhow!("ffmpeg 录制启动失败: {}（完整命令: {}）", e, cmdline_for_display))?;
+        .map_err(|e| {
+            anyhow!(
+                "ffmpeg 录制启动失败: {}\n\
+                 完整命令: {}\n\
+                 spawn 上下文：\n\
+                 · ffmpeg 路径: {}\n\
+                 · ffmpeg cwd:  {}\n\
+                 · ffmpeg stderr 日志: {}\n\
+                 · 提示：把「完整命令」整行复制到 cmd 里手动跑可验证是否被外力 kill",
+                e, cmdline_for_display, ffmpeg_bin, ffmpeg_dir.display(), stderr_log.display()
+            )
+        })?;
 
     // 启动后等待 ffmpeg 连接流（2 秒）
     std::thread::sleep(std::time::Duration::from_millis(2000));
