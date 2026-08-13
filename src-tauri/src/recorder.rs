@@ -285,7 +285,8 @@ fn finalize_partial_or_cleanup<R: Runtime>(
 
 /// 启动 ffmpeg 录制子进程
 ///
-/// 关键：通过 `cmd /c` 启动（和用户手动在 cmd 里跑 ffmpeg 的环境完全一致），
+/// 直接 spawn ffmpeg（不用 cmd /c 包装）：Rust Command 用 CreateProcessW 标准引号规则，
+/// 每个 arg 作为独立参数传递，避免 cmd.exe 二次解析破坏含空格/中文的路径。
 /// stderr 重定向到工作目录日志文件（避免管道句柄可能导致的异常终止），
 /// 并记录完整命令行，失败时给用户可手动复现的命令。
 fn start_ffmpeg(
@@ -347,11 +348,15 @@ fn start_ffmpeg(
         ]
     };
 
-    // 构造 cmd /c 命令行：`cmd /c ""C:\...\ffmpeg.exe" -y -i "URL" ..."`
-    let cmdline = build_cmdline(&ffmpeg_bin, &args);
-    let mut cmd = Command::new("cmd");
-    cmd.arg("/c")
-        .arg(&cmdline)
+    // 直接 spawn ffmpeg（不用 cmd /c 包装）。
+    // 关键：Rust Command::new(bin).args(args) 在 Windows 上用 CreateProcessW 标准引号规则，
+    // 每个 arg 作为独立参数传递，Rust 自动处理含空格/特殊字符的引号转义，没有 cmd 二次解析。
+    // 之前用 cmd /c 包装会引入 cmd.exe 的引号剥离规则，把含空格的路径
+    // （如 C:\Program Files\抖音直播录屏\ffmpeg\ffmpeg.exe）搞坏 → 路径首字符被加反斜杠
+    // （\\D:\...）→ ffmpeg exit 1。transcode.rs / detector.rs 一直用直接 spawn 从未出问题。
+    let cmdline_for_display = format!("{} {}", ffmpeg_bin, args.join(" "));
+    let mut cmd = Command::new(&ffmpeg_bin);
+    cmd.args(&args)
         .current_dir(&ffmpeg_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(
@@ -360,14 +365,14 @@ fn start_ffmpeg(
             })?,
         ));
     let mut child = spawn_hidden(&mut cmd)
-        .map_err(|e| anyhow!("ffmpeg 录制启动失败: {}（完整命令: {}）", e, cmdline))?;
+        .map_err(|e| anyhow!("ffmpeg 录制启动失败: {}（完整命令: {}）", e, cmdline_for_display))?;
 
     // 启动后等待 ffmpeg 连接流（2 秒）
     std::thread::sleep(std::time::Duration::from_millis(2000));
     if let Ok(Some(status)) = child.try_wait() {
         if !status.success() {
             let stderr = read_stderr_file(&stderr_log);
-            return Err(ffmpeg_exit_error(&stderr, status.code(), 2, mode, &cmdline));
+            return Err(ffmpeg_exit_error(&stderr, status.code(), 2, mode, &cmdline_for_display));
         }
     }
 
@@ -382,7 +387,7 @@ fn start_ffmpeg(
         if let Ok(Some(status)) = child.try_wait() {
             if !status.success() {
                 let stderr = read_stderr_file(&stderr_log);
-                return Err(ffmpeg_exit_error(&stderr, status.code(), 5, mode, &cmdline));
+                return Err(ffmpeg_exit_error(&stderr, status.code(), 5, mode, &cmdline_for_display));
             }
         }
         let stderr = read_stderr_file(&stderr_log);
@@ -397,7 +402,7 @@ fn start_ffmpeg(
              \n完整命令：{}\n\
              \nffmpeg stderr 日志：\n{}",
             5,
-            cmdline,
+            cmdline_for_display,
             stderr
         ));
     }
@@ -409,36 +414,6 @@ fn start_ffmpeg(
         process: Some(child),
         started_at: now_ts(),
     })
-}
-
-/// 构造 `cmd /c ""<bin>" <args...>"` 命令行字符串
-fn build_cmdline(bin: &str, args: &[String]) -> String {
-    let mut s = String::new();
-    s.push('"');
-    s.push_str(bin);
-    s.push('"');
-    for a in args {
-        s.push(' ');
-        s.push_str(&quote_win_arg(a));
-    }
-    s
-}
-
-/// Windows cmd 参数引号包裹：
-/// 含空格/&/%/(/)/引号 等特殊字符时加引号（cmd 里引号内的 & % 不会作分隔符/变量展开）
-fn quote_win_arg(a: &str) -> String {
-    if a.is_empty() {
-        return "\"\"".into();
-    }
-    let special = a
-        .chars()
-        .any(|c| c == ' ' || c == '&' || c == '%' || c == '(' || c == ')' || c == '"' || c == '^');
-    if !special {
-        return a.to_string();
-    }
-    // 内部引号转义为 ^"（cmd 转义）
-    let escaped = a.replace('"', "^\"");
-    format!("\"{}\"", escaped)
 }
 
 /// 读取 ffmpeg stderr 日志文件（截断展示，含提示）
