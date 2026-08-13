@@ -37,7 +37,7 @@ jobs:
       - name: Build NSIS installer
         run: |
           choco install nsis -y --no-progress
-          makensis.exe /DVERSION=3.9 douyin_setup.nsi
+          & "C:\Program Files (x86)\NSIS\makensis.exe" douyin_setup.nsi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
