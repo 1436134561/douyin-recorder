@@ -284,6 +284,10 @@ fn finalize_partial_or_cleanup<R: Runtime>(
 }
 
 /// 启动 ffmpeg 录制子进程
+///
+/// 关键：通过 `cmd /c` 启动（和用户手动在 cmd 里跑 ffmpeg 的环境完全一致），
+/// stderr 重定向到工作目录日志文件（避免管道句柄可能导致的异常终止），
+/// 并记录完整命令行，失败时给用户可手动复现的命令。
 fn start_ffmpeg(
     room_id: &str,
     cfg: &AppConfig,
@@ -295,97 +299,79 @@ fn start_ffmpeg(
 
     let mode = decide_mode(cfg, room);
     let ffmpeg_bin = ffmpeg_executable();
-    // 关键修复：把 child 工作目录设为 ffmpeg.exe 所在目录。
-    // mingw 编译的 ffmpeg（gyan.dev essentials / BtbN nightly）依赖同目录的
-    // gnuwin32 runtime DLL。如果 spawn 时 cwd 不在 ffmpeg 同目录，
-    // DLL 加载阶段就异常退出（exit code 0xABAFB008 这种异常值，stderr 只有 banner）。
-    // 用户实测：cmd 里 cd 到 ffmpeg 同目录手动跑 -version 完全正常，
-    // 但应用 spawn 后立即崩——100% 是这个 working dir 问题。
+    // working dir = ffmpeg.exe 所在目录（mingw ffmpeg 依赖同目录 runtime DLL）
     let ffmpeg_dir = std::path::Path::new(&ffmpeg_bin)
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // stderr 日志文件（代替管道：避免管道句柄被父进程持有导致 ffmpeg 写满阻塞/异常）
+    let stderr_log = work.join("ffmpeg_stderr.log");
+    let _ = std::fs::File::create(&stderr_log);
 
-    let mut child = if mode == "stream" {
+    let args: Vec<String> = if mode == "stream" {
         let url = room
             .and_then(|r| r.stream_url.clone())
             .or_else(|| resolve_stream_url(room_id))
             .ok_or_else(|| anyhow!("房间 {} 未配置直播流地址", room_id))?;
         let seg_time = cfg.segment_minutes.max(1) * 60;
         let out_tmpl = work.join("seg_%03d.flv");
-        let mut cmd = Command::new(&ffmpeg_bin);
-        cmd.current_dir(&ffmpeg_dir)
-            .args([
-            "-y",
-            "-v", "info",  // 详细日志：能看到 HTTP 403/网络错误等真实失败原因
-            "-i",
-            &url,
-            "-c",
-            "copy",
-            "-f",
-            "segment",
-            "-segment_time",
-            &seg_time.to_string(),
-            "-segment_format",
-            "flv",
-            "-reset_timestamps",
-            "1",
-            "-vsync",
-            "0",
-            "-reconnect",
-            "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_delay_max",
-            "5",
-            &out_tmpl.to_string_lossy(),
-        ])
-        .stderr(std::process::Stdio::piped());
-        spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 录制启动失败: {}", e))?
+        vec![
+            "-y".into(),
+            "-v".into(), "info".into(),
+            "-i".into(), url,
+            "-c".into(), "copy".into(),
+            "-f".into(), "segment".into(),
+            "-segment_time".into(), seg_time.to_string(),
+            "-segment_format".into(), "flv".into(),
+            "-reset_timestamps".into(), "1".into(),
+            "-vsync".into(), "0".into(),
+            "-reconnect".into(), "1".into(),
+            "-reconnect_streamed".into(), "1".into(),
+            "-reconnect_delay_max".into(), "5".into(),
+            out_tmpl.to_string_lossy().into(),
+        ]
     } else {
         let src = cfg.screen_source.clone().unwrap_or_else(|| "desktop".into());
         let out_file = work.join("rec.mp4");
-        let mut cmd = Command::new(&ffmpeg_bin);
-        cmd.current_dir(&ffmpeg_dir)
-            .args([
-            "-y",
-            "-v", "info",
-            "-f",
-            "gdigrab",
-            "-framerate",
-            "30",
-            "-i",
-            &src,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "mp4",
-            &out_file.to_string_lossy(),
-        ])
-        .stderr(std::process::Stdio::piped());
-        spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 屏幕录制启动失败: {}", e))?
+        vec![
+            "-y".into(),
+            "-v".into(), "info".into(),
+            "-f".into(), "gdigrab".into(),
+            "-framerate".into(), "30".into(),
+            "-i".into(), src,
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), "ultrafast".into(),
+            "-pix_fmt".into(), "yuv420p".into(),
+            "-f".into(), "mp4".into(),
+            out_file.to_string_lossy().into(),
+        ]
     };
 
-    // 关键修复：不用后台线程 + Arc<Mutex>，避免竞态。
-    // 直接 take stderr 句柄保留；等 ffmpeg 退出后同步排空（管道已关闭，read_to_end 立即返回）
-    let stderr_handle: Option<std::process::ChildStderr> = child.stderr.take();
+    // 构造 cmd /c 命令行：`cmd /c ""C:\...\ffmpeg.exe" -y -i "URL" ..."`
+    let cmdline = build_cmdline(&ffmpeg_bin, &args);
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/c")
+        .arg(&cmdline)
+        .current_dir(&ffmpeg_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            std::fs::File::options().append(true).open(&stderr_log).map_err(|e| {
+                anyhow!("无法打开 ffmpeg stderr 日志 {}: {}", stderr_log.display(), e)
+            })?,
+        ));
+    let mut child = spawn_hidden(&mut cmd)
+        .map_err(|e| anyhow!("ffmpeg 录制启动失败: {}（完整命令: {}）", e, cmdline))?;
 
-    // 启动后等待 ffmpeg 连接流（流地址解析/握手可能慢；2 秒比之前 0.6 秒更宽裕）
+    // 启动后等待 ffmpeg 连接流（2 秒）
     std::thread::sleep(std::time::Duration::from_millis(2000));
     if let Ok(Some(status)) = child.try_wait() {
         if !status.success() {
-            // 同步排空 stderr（管道已随进程退出而关闭，read_to_end 立即返回所有数据）
-            let stderr = drain_stderr(stderr_handle);
-            return Err(ffmpeg_exit_error(&stderr, status.code(), 2, mode));
+            let stderr = read_stderr_file(&stderr_log);
+            return Err(ffmpeg_exit_error(&stderr, status.code(), 2, mode, &cmdline));
         }
     }
 
     // 再等 3 秒检查：ffmpeg 进程是活着的，且 seg_000.flv 有没有开始收到数据？
-    // 若 3 秒后 seg_000.flv 仍是 0 字节 → 流地址大概率已过期（抖音 URL 时效性 ~几分钟）
     std::thread::sleep(std::time::Duration::from_millis(3000));
     let seg_file = work.join("seg_000.flv");
     let has_data = seg_file
@@ -395,11 +381,11 @@ fn start_ffmpeg(
     if !has_data {
         if let Ok(Some(status)) = child.try_wait() {
             if !status.success() {
-                let stderr = drain_stderr(stderr_handle);
-                return Err(ffmpeg_exit_error(&stderr, status.code(), 5, mode));
+                let stderr = read_stderr_file(&stderr_log);
+                return Err(ffmpeg_exit_error(&stderr, status.code(), 5, mode, &cmdline));
             }
         }
-        let stderr = drain_stderr(stderr_handle);
+        let stderr = read_stderr_file(&stderr_log);
         return Err(anyhow!(
             "开始录制 {} 秒后仍未收到数据。\n\
              可能原因：\n\
@@ -408,14 +394,13 @@ fn start_ffmpeg(
              ③ 网络防火墙 / 代理问题\n\
              \n\
              请确认直播间正在直播，并重新开始录制。\n\
-             \nffmpeg stderr 尾部：\n{}",
+             \n完整命令：{}\n\
+             \nffmpeg stderr 日志：\n{}",
             5,
+            cmdline,
             stderr
         ));
     }
-
-    // 一切正常：丢弃 stderr 句柄，让 child 句柄继续持有（后续杀进程会清理）
-    drop(stderr_handle);
 
     Ok(RecordingSession {
         room_id: room_id.to_string(),
@@ -426,30 +411,51 @@ fn start_ffmpeg(
     })
 }
 
-/// 同步排空 ffmpeg stderr（管道随子进程退出已关闭，read_to_end 立即返回所有数据）
-/// 避免后台线程 + Arc<Mutex> 的竞态：之前 read_stderr 可能在后台线程读完前调用，
-/// 导致只能看到 banner 而看不到真正的错误信息。
-fn drain_stderr(stderr: Option<std::process::ChildStderr>) -> String {
-    use std::io::Read;
-    let mut s = match stderr {
-        Some(s) => s,
-        None => return String::from("（stderr 未捕获）"),
-    };
-    let mut buf = Vec::with_capacity(2048);
-    match (&mut s).take(8 * 1024).read_to_end(&mut buf) {
-        Ok(_) => {}
-        Err(_) => {
-            // 退路：best-effort
-            let _ = s.read_to_end(&mut buf);
-        }
+/// 构造 `cmd /c ""<bin>" <args...>"` 命令行字符串
+fn build_cmdline(bin: &str, args: &[String]) -> String {
+    let mut s = String::new();
+    s.push('"');
+    s.push_str(bin);
+    s.push('"');
+    for a in args {
+        s.push(' ');
+        s.push_str(&quote_win_arg(a));
     }
-    if buf.is_empty() {
-        return String::from("（stderr 无输出，可能 ffmpeg 被外部进程强制终止，如杀毒软件）");
+    s
+}
+
+/// Windows cmd 参数引号包裹：
+/// 含空格/&/%/(/)/引号 等特殊字符时加引号（cmd 里引号内的 & % 不会作分隔符/变量展开）
+fn quote_win_arg(a: &str) -> String {
+    if a.is_empty() {
+        return "\"\"".into();
     }
-    String::from_utf8_lossy(&buf)
+    let special = a
         .chars()
-        .take(1500) // 略放宽，可见更多上下文
-        .collect()
+        .any(|c| c == ' ' || c == '&' || c == '%' || c == '(' || c == ')' || c == '"' || c == '^');
+    if !special {
+        return a.to_string();
+    }
+    // 内部引号转义为 ^"（cmd 转义）
+    let escaped = a.replace('"', "^\"");
+    format!("\"{}\"", escaped)
+}
+
+/// 读取 ffmpeg stderr 日志文件（截断展示，含提示）
+fn read_stderr_file(log: &std::path::Path) -> String {
+    match std::fs::read_to_string(log) {
+        Ok(s) if !s.trim().is_empty() => {
+            let mut t = s;
+            // 截断到 ~2KB
+            if t.chars().count() > 2000 {
+                t = t.chars().take(2000).collect::<String>();
+                t.push_str("\n...（截断）");
+            }
+            t
+        }
+        Ok(_) => String::from("（stderr 日志为空）"),
+        Err(e) => format!("（读取 stderr 日志失败: {}）", e),
+    }
 }
 
 /// 生成 ffmpeg 退出错误（包含十六进制退出码 + stderr 尾部 + 分类提示）
@@ -460,7 +466,13 @@ fn drain_stderr(stderr: Option<std::process::ChildStderr>) -> String {
 ///   stderr 只有 banner 没有错误消息也是同一信号。
 /// - 高位 0xC000000x：Windows 异常码（如 0xC0000005 access violation / 0xC0000409 stack overflow）
 /// - 其他常见：1（普通错误）、-1（无法获取）
-fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &str) -> anyhow::Error {
+fn ffmpeg_exit_error(
+    stderr: &str,
+    code: Option<i32>,
+    waited_secs: u64,
+    mode: &str,
+    cmdline: &str,
+) -> anyhow::Error {
     let c = code.unwrap_or(-1);
     let hex = if c >= 0 {
         format!("0x{:08X}", c as u32)
@@ -478,20 +490,13 @@ fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &s
         || stderr.contains("stderr 未捕获");
 
     // 分类提示（按优先级：abnormal_code > empty_stderr > 关键词）
-    // 关键：异常退出码（0xABxxxxxx 或 0xC000000x）单独就触发"疑似杀毒"提示
-    // 不再要求 stderr 必须空 —— mingw ffmpeg 至少会打 banner，所以 stderr 不空但 exit code 异常
-    // = 进程在 banner 后被外力 kill（典型 AV 启发式特征）
     let hint = if abnormal_code {
-        "🚨 高度疑似被杀毒软件 / Windows Defender 拦截（99% 概率）：\n\
+        "🚨 高度疑似被杀毒软件 / Windows Defender 拦截：\n\
          · 异常退出码 0xABxxxxxx 是 Windows 调试堆填充 + 进程被外力 kill 的特征\n\
          · stderr 即使有内容也只有 banner，banner 后立刻退出 = 进程初始化阶段被杀\n\
-         · mingw 编译的 ffmpeg.exe 常被 AV 启发式标记\n\
-         · 修复（30 秒验证）：\n\
-           1. 临时关 Windows Defender 实时保护（设置 → 病毒防护 → 管理设置 → 实时保护 关）\n\
-           2. 再点一次立即录制\n\
-           3. 如果成功 → 100% 确认是杀毒\n\
-           4. 把 ffmpeg.exe 和安装目录加入白名单，再开实时保护\n\
-         · 或直接在 Windows 安全中心 → 病毒防护 → 排除项 → 添加文件/文件夹"
+         · 验证：把下方「完整命令」复制到 cmd 里手动跑一次 ——\n\
+           - 手动能跑 → 是应用启动方式/杀毒拦截，反馈给我\n\
+           - 手动也崩 → ffmpeg 或系统组件问题，请提供手动运行的输出"
     } else if empty_stderr {
         "🚨 疑似被杀毒软件 / Windows Defender 拦截：stderr 无输出说明 ffmpeg 进程被外力终止"
     } else if stderr.contains("403") || stderr.contains("Forbidden") {
@@ -511,14 +516,16 @@ fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &s
          排查方向：\n\
          ① 流地址已过期（抖音 flv URL 几分钟就失效，重新开始录制会自动重新解析）\n\
          ② 主播未在直播或被风控拦截\n\
-         ③ 杀毒软件 / Windows Defender 把 ffmpeg.exe 当作可疑进程杀掉（最常见）\n\
+         ③ 杀毒软件 / Windows Defender 把 ffmpeg.exe 当作可疑进程杀掉\n\
          ④ ffmpeg 找不到或缺少编解码器\n\
          \n\
-         ffmpeg stderr 尾部：\n{}",
+         📋 完整命令（可复制到 cmd 手动运行以复现/定位）：\n{}\n\
+         \nffmpeg stderr 日志：\n{}",
         waited_secs,
         c,
         hex,
         hint,
+        cmdline,
         stderr
     )
 }
