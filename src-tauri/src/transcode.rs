@@ -8,18 +8,35 @@ use std::os::windows::process::CommandExt;
 
 use crate::ffmpeg::ffmpeg_executable;
 
-/// 运行 ffmpeg，吞掉 stderr（仅用于流水线，不向用户暴露日志）
+/// 运行 ffmpeg，捕获 stderr 便于错误诊断
 fn run_ffmpeg(args: &[String]) -> Result<()> {
     let mut cmd = Command::new(ffmpeg_executable());
     cmd.args(args)
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     { cmd.creation_flags(0x08000000); }
-    let status = cmd
-        .status()
+    let output = cmd
+        .output()
         .map_err(|e| anyhow!("找不到 ffmpeg（{}），请确认已安装并加入 PATH", e))?;
-    if !status.success() {
-        return Err(anyhow!("ffmpeg 执行失败，参数: {:?}", args));
+    if !output.status.success() {
+        // 优先用 GBK 解码（中文 Windows 默认），失败再回退 UTF-8 容错
+        let stderr_bytes = output.stderr;
+        let stderr = encoding_rs::GBK
+            .decode(&stderr_bytes)
+            .0
+            .into_owned();
+        let stderr = if stderr.contains('\u{FFFD}') {
+            String::from_utf8_lossy(&stderr_bytes).into_owned()
+        } else {
+            stderr
+        };
+        // 截断到 ~1.5KB 避免错误信息过大
+        let tail: String = stderr.chars().rev().take(1500).collect::<String>().chars().rev().collect();
+        return Err(anyhow!(
+            "ffmpeg 执行失败。参数: {:?}\n\nffmpeg stderr 尾部:\n{}",
+            args, tail
+        ));
     }
     Ok(())
 }
@@ -124,10 +141,11 @@ pub fn export_segments(input: &Path, segments: &[(f64, f64)], output: &Path) -> 
             "[0:a]atrim=start={}:end={},asetpts=PTS-STARTPTS[{}];",
             s, e, ai
         ));
-        vlabels.push(vi);
-        alabels.push(ai);
+        // 注意：concat 语法要求输入是 "[v0][v1]..." 而不是 "v0v1..."
+        vlabels.push(format!("[{}]", vi));
+        alabels.push(format!("[{}]", ai));
     }
-    let vconcat = format!("{}concat=n={}:v=1:a=0[v]", vlabels.join(""), n);
+    let vconcat = format!("{}concat=n={}:v=1:a=0[v];", vlabels.join(""), n);
     let aconcat = format!("{}concat=n={}:v=0:a=1[a]", alabels.join(""), n);
     filter.push_str(&vconcat);
     filter.push_str(&aconcat);
