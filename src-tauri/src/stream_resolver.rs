@@ -513,10 +513,47 @@ fn recursive_find_streams(
 }
 
 /// 从 HashMap 中按画质优先级选择最佳 FLV URL
+///
+/// 抖音 API 的 flv_pull_url 字段 key 不是标准的 OR4/UHD/HD/SD/LD，
+/// 而是 FULL_HD1/HD1/SD1/SD2 这种自定义命名，或 URL 本身含 _ld/_sd/_hd/_uhd/_or4 标识。
+/// 所以既要匹配标准 key，也要按 URL 内容和 key 模式综合判断画质。
 fn best_flv(urls: &HashMap<String, String>) -> Option<String> {
-    for q in QUALITY_ORDER {
-        let key = format!("flv:{}", q);
-        if let Some(url) = urls.get(&key) {
+    // 收集所有 flv 候选 + 识别画质等级
+    #[derive(Clone, Copy)]
+    enum Q { Origin, Uhd, Hd, Sd, Ld, Unknown }
+    fn quality_of(key: &str, url: &str) -> Q {
+        let s = format!("{} {}", key, url).to_lowercase();
+        // 原画/最高
+        if s.contains("or4") || s.contains("origin") || s.contains("raw") || s.contains("full_hd1") || s.contains("uhd") { return Q::Origin; }
+        if s.contains("full_hd") || s.contains("1080") { return Q::Uhd; }
+        if s.contains("_hd") || s.contains("hd1") || s.contains("720") { return Q::Hd; }
+        if s.contains("_sd") || s.contains("sd1") || s.contains("sd2") || s.contains("480") { return Q::Sd; }
+        if s.contains("_ld") || s.contains("ld1") || s.contains("360") || s.contains("240") { return Q::Ld; }
+        Q::Unknown
+    }
+    let order = [Q::Origin, Q::Uhd, Q::Hd, Q::Sd, Q::Ld, Q::Unknown];
+    for want in order {
+        // 先按标准 key 找（flv:OR4 这种）
+        let std_keys = match want {
+            Q::Origin => &["flv:OR4", "flv:UHD"][..],
+            Q::Uhd => &["flv:UHD"][..],
+            Q::Hd => &["flv:HD"][..],
+            Q::Sd => &["flv:SD"][..],
+            Q::Ld => &["flv:LD"][..],
+            Q::Unknown => &[][..],
+        };
+        for k in std_keys {
+            if let Some(url) = urls.get(*k) {
+                return Some(url.clone());
+            }
+        }
+        // 再按 URL/key 内容识别画质
+        let mut found: Vec<&String> = urls.iter()
+            .filter(|(k, _)| k.starts_with("flv:"))
+            .filter(|(k, v)| quality_of(k, v) as u8 == want as u8)
+            .map(|(_, v)| v)
+            .collect();
+        if let Some(url) = found.pop() {
             return Some(url.clone());
         }
     }
@@ -529,11 +566,40 @@ fn best_flv(urls: &HashMap<String, String>) -> Option<String> {
     None
 }
 
-/// 从 HashMap 中选择最佳 HLS URL
+/// 从 HashMap 中选择最佳 HLS URL（同 best_flv 的画质识别逻辑）
 fn best_hls(urls: &HashMap<String, String>) -> Option<String> {
-    for q in QUALITY_ORDER {
-        let key = format!("hls:{}", q);
-        if let Some(url) = urls.get(&key) {
+    #[derive(Clone, Copy)]
+    enum Q { Origin, Uhd, Hd, Sd, Ld, Unknown }
+    fn quality_of(key: &str, url: &str) -> Q {
+        let s = format!("{} {}", key, url).to_lowercase();
+        if s.contains("or4") || s.contains("origin") || s.contains("raw") || s.contains("full_hd1") || s.contains("uhd") { return Q::Origin; }
+        if s.contains("full_hd") || s.contains("1080") { return Q::Uhd; }
+        if s.contains("_hd") || s.contains("hd1") || s.contains("720") { return Q::Hd; }
+        if s.contains("_sd") || s.contains("sd1") || s.contains("sd2") || s.contains("480") { return Q::Sd; }
+        if s.contains("_ld") || s.contains("ld1") || s.contains("360") || s.contains("240") { return Q::Ld; }
+        Q::Unknown
+    }
+    let order = [Q::Origin, Q::Uhd, Q::Hd, Q::Sd, Q::Ld, Q::Unknown];
+    for want in order {
+        let std_keys = match want {
+            Q::Origin => &["hls:OR4", "hls:UHD"][..],
+            Q::Uhd => &["hls:UHD"][..],
+            Q::Hd => &["hls:HD"][..],
+            Q::Sd => &["hls:SD"][..],
+            Q::Ld => &["hls:LD"][..],
+            Q::Unknown => &[][..],
+        };
+        for k in std_keys {
+            if let Some(url) = urls.get(*k) {
+                return Some(url.clone());
+            }
+        }
+        let mut found: Vec<&String> = urls.iter()
+            .filter(|(k, _)| k.starts_with("hls:"))
+            .filter(|(k, v)| quality_of(k, v) as u8 == want as u8)
+            .map(|(_, v)| v)
+            .collect();
+        if let Some(url) = found.pop() {
             return Some(url.clone());
         }
     }
