@@ -101,6 +101,7 @@ mod tests {
                 monitor_poll_secs: 30,
                 url_renew_lead_secs: 120,
                 max_renew_attempts: 3,
+                url_renew_interval_secs: 900,
             },
             recordings: Default::default(),
             detectors: Default::default(),
@@ -177,5 +178,87 @@ mod tests {
         // screen 模式依赖 ffmpeg；缺失时应返回 Err（前端可捕获并提示），而非 panic
         let r = recorder::begin_recording("r", false, &handle, &shared);
         assert!(r.is_err(), "ffmpeg 缺失时应返回 Err 而非 panic");
+    }
+
+    /// gather_segments 多代收集：legacy 根目录 + gen0 + gen1 顺序正确且排除 merged.flv
+    #[test]
+    fn gather_segments_multi_generation_order() {
+        use std::path::PathBuf;
+        let base = std::env::temp_dir().join("douyin_recorder_test_gather");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(base.join("gen0")).unwrap();
+        std::fs::create_dir_all(base.join("gen1")).unwrap();
+        std::fs::create_dir_all(base.join("gen10")).unwrap(); // 验证数字排序 gen10 在 gen1 后
+
+        // 写假分片（>1KB）
+        fn write_flv(p: &PathBuf, size: usize) {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; size]).unwrap();
+        }
+        write_flv(&base.join("seg_000.flv"), 2048);       // legacy 最早
+        write_flv(&base.join("gen0").join("seg_000.flv"), 2048);
+        write_flv(&base.join("gen0").join("seg_001.flv"), 2048);
+        write_flv(&base.join("gen1").join("seg_000.flv"), 2048);
+        write_flv(&base.join("gen10").join("seg_000.flv"), 2048);
+        write_flv(&base.join("merged.flv"), 2048);        // 产物，应被排除
+        // 空壳（<1KB）应被过滤
+        write_flv(&base.join("gen0").join("seg_002.flv"), 512);
+
+        let session = crate::recorder::RecordingSession {
+            room_id: "test".into(),
+            mode: "stream".into(),
+            work_dir: base.clone(),
+            process: None,
+            started_at: 0,
+            renew_attempts: 0,
+            current_url: "http://x".into(),
+            generation: 0,
+            last_renew_at: 0,
+            renewing: false,
+        };
+        let files = crate::recorder::gather_segments(&session);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&base)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "seg_000.flv",                    // legacy
+                "gen0/seg_000.flv",               // gen0 内按文件名排序
+                "gen0/seg_001.flv",
+                "gen1/seg_000.flv",               // gen1
+                "gen10/seg_000.flv",              // gen10（数字排序在 gen1 后）
+            ],
+            "多代收集顺序应为 legacy → gen0 → gen1 → gen10，且排除 merged.flv 与空壳"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// flv_expiry_secs：绝对秒 / 毫秒级 / 相对秒 / 无参数
+    #[test]
+    fn flv_expiry_secs_parsing() {
+        use crate::stream_resolver::flv_expiry_secs;
+        // 绝对秒（10 位）
+        assert_eq!(flv_expiry_secs("http://x.flv?expire=1787237249"), Some(1787237249));
+        // 毫秒级（13 位）→ ÷1000
+        assert_eq!(flv_expiry_secs("http://x.flv?expire=1787237249000"), Some(1787237249));
+        // 相对秒（<1e9）→ now + 1800
+        let v = flv_expiry_secs("http://x.flv?expire=600").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(v >= now + 1790 && v <= now + 1810, "相对秒应约为 now+1800，实际 {}", v);
+        // 无过期参数 → None
+        assert_eq!(flv_expiry_secs("http://x.flv?sign=abc"), None);
+        // 无查询参数 → None
+        assert_eq!(flv_expiry_secs("http://x.flv"), None);
     }
 }

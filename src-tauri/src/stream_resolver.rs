@@ -963,8 +963,11 @@ pub fn flv_expiry_secs(url: &str) -> Option<i64> {
         match k {
             "expire" | "expires" | "Expires" => {
                 if let Ok(n) = v.parse::<i64>() {
-                    if n > 1_000_000_000 {
-                        // 绝对秒（2025+ 之后都是这种）
+                    if n > 100_000_000_000 {
+                        // 毫秒级（12-13 位，如 1.78e12）：÷1000 转秒
+                        expire = Some(n / 1000);
+                    } else if n > 1_000_000_000 {
+                        // 绝对秒（10 位，2025+ 之后都是这种）
                         expire = Some(n);
                     } else {
                         // 相对秒（兜底，加上 1800 = 30 分钟作为过期时间）
@@ -975,7 +978,9 @@ pub fn flv_expiry_secs(url: &str) -> Option<i64> {
             "t" => {
                 if expire.is_none() {
                     if let Ok(n) = v.parse::<i64>() {
-                        if n > 1_000_000_000 {
+                        if n > 100_000_000_000 {
+                            expire = Some(n / 1000);
+                        } else if n > 1_000_000_000 {
                             expire = Some(n);
                         } else {
                             fallback = Some(1800);

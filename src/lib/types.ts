@@ -21,6 +21,12 @@ export interface AppConfig {
   rooms: RoomConfig[]
   /** 直播状态探测间隔（秒）。monitor 线程每 N 秒探测一次开播。默认 30，范围 20-120 */
   monitor_poll_secs?: number
+  /** URL 过期前主动续流的提前秒数（默认 120） */
+  url_renew_lead_secs?: number
+  /** 续流最大重试次数（默认 3） */
+  max_renew_attempts?: number
+  /** URL 无 expire 参数时的定期兜底重解析间隔秒（默认 900） */
+  url_renew_interval_secs?: number
 }
 
 export interface RecordingInfo {

@@ -72,14 +72,21 @@ pub fn start<R: Runtime>(
             };
 
             // 记录探测状态到全局 state（供 get_status 兜底返回）
+            // 注意：live=false 时**保留**原 live_false_count（由 drive_state_machine 累加），
+            // 只 live=true 时清零 —— 否则每轮 poll 重置为 1 + drive_state_machine +1 = 首次 false 就停
             {
                 let mut st = state_clone.lock().unwrap();
+                let prev_count = st
+                    .monitor_states
+                    .get(&room_id_clone)
+                    .map(|m| m.live_false_count)
+                    .unwrap_or(0);
                 st.monitor_states.insert(
                     room_id_clone.clone(),
                     MonitorState {
                         live,
                         last_poll_ts: poll_ts,
-                        live_false_count: if live { 0 } else { 1 },
+                        live_false_count: if live { 0 } else { prev_count },
                     },
                 );
             }

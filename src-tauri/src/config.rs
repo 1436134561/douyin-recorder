@@ -65,12 +65,16 @@ pub struct AppConfig {
     /// URL 失效自动续流的最大重试次数（被动续命）。重试用尽才 emit recording_failed。
     #[serde(default = "default_max_renew")]
     pub max_renew_attempts: u32,
+    /// URL 无 expire 参数时的定期兜底重解析间隔（秒）。默认 15 分钟。
+    #[serde(default = "default_renew_interval")]
+    pub url_renew_interval_secs: u64,
 }
 
 fn default_true() -> bool { true }
 fn default_30() -> u64 { 30 }
 fn default_renew_lead() -> u64 { 120 }
 fn default_max_renew() -> u32 { 3 }
+fn default_renew_interval() -> u64 { 900 }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -93,6 +97,7 @@ impl Default for AppConfig {
             monitor_poll_secs: 30,
             url_renew_lead_secs: 120,
             max_renew_attempts: 3,
+            url_renew_interval_secs: 900,
         }
     }
 }

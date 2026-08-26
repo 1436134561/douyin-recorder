@@ -23,6 +23,8 @@ export const useStore = defineStore('app', () => {
   const editorFile = ref<RecordingInfo | null>(null)
   const toast = ref<{ type: 'ok' | 'err'; msg: string } | null>(null)
   let toastTimer: number | undefined
+  // 续流 toast 节流：30s 内只弹一次
+  let lastRenewToastAt: number | undefined
   // 状态轻量轮询：覆盖 detector 死亡、stop_and_finalize 同步阻塞期间前端 statuses 陈旧等场景
   let statusPollTimer: number | undefined
 
@@ -118,10 +120,15 @@ export const useStore = defineStore('app', () => {
       notify('err', `录制已自动停止（${e.room_id}）：${e.reason}`)
     })
     api.on('recording_renewed', (p) => {
-      // 后端检测到 ffmpeg 死亡 → 自动重新解析 URL + 重启成功
+      // 后端自动续流成功（主动=URL 过期前预换；被动=断流后救活）
       // 前端仅给提示，不刷新 statuses（recording 一直是 true）
-      const e = p as { room_id: string; attempt: number; max_attempts: number }
-      notify('ok', `录制自动续流成功（${e.room_id}，第 ${e.attempt}/${e.max_attempts} 次）`)
+      const e = p as { room_id: string; proactive?: boolean; generation?: number }
+      // 节流：30s 内只弹一次 toast，避免频繁续流/重试时打扰
+      const now = Date.now()
+      if (!lastRenewToastAt || now - lastRenewToastAt > 30_000) {
+        lastRenewToastAt = now
+        notify('ok', `录制自动续流成功（${e.room_id}）`)
+      }
       // 兜底刷新一次：保险
       refreshStatuses()
     })

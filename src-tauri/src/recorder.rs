@@ -30,6 +30,12 @@ pub struct RecordingSession {
     pub renew_attempts: u32,
     /// 当前正在使用的 FLV URL（用于续流时校验/复用）。
     pub current_url: String,
+    /// 当前分片代数（0 起始）。续流一次 +1，分片写到 work_dir/gen{generation}/
+    pub generation: u32,
+    /// 上次续流时间（Unix 秒）。用于主动续流节流（防看护线程重复触发）。
+    pub last_renew_at: i64,
+    /// 续流进行中标志（防主动/被动并发重入）。
+    pub renewing: bool,
 }
 
 fn now_ts() -> i64 {
@@ -154,6 +160,24 @@ pub fn begin_recording<R: Runtime>(
     Ok(())
 }
 
+/// 递归统计目录下所有 .flv 文件字节数（含子目录 genN）。
+fn recursive_flv_bytes(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                total += recursive_flv_bytes(&p);
+            } else if p.extension().map(|x| x == "flv").unwrap_or(false) {
+                if let Ok(m) = std::fs::metadata(&p) {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
+}
+
 /// 后台看护线程：每 5 秒检查 ffmpeg 是否还活着 + work_dir 文件是否在增长
 ///
 /// 故障检测：
@@ -195,6 +219,40 @@ fn spawn_recording_watcher<R: Runtime>(
                 break;
             }
 
+            // 1.5 主动续流：进程存活时检查 URL 是否临近过期（从源头避免断流）
+            if child_alive {
+                let (need_renew, is_renewing) = {
+                    let st = state.lock().unwrap();
+                    let mut need = false;
+                    if let Some(session) = st.recordings.get(&room_id) {
+                        if !session.renewing {
+                            let now = now_ts();
+                            let lead = st.config.url_renew_lead_secs as i64;
+                            let interval = st.config.url_renew_interval_secs as i64;
+                            let since_last = now - session.last_renew_at;
+                            if let Some(expire) = crate::stream_resolver::flv_expiry_secs(&session.current_url) {
+                                // URL 有 expire：临近过期才续流
+                                if now >= expire - lead && since_last > 30 {
+                                    need = true;
+                                }
+                            } else if since_last > interval {
+                                // URL 无 expire 参数：定期兜底重解析
+                                need = true;
+                            }
+                        }
+                    }
+                    (need, false)
+                };
+                if need_renew && !is_renewing {
+                    let ok = renew_recording_stream(&room_id, &app, &state, true);
+                    if ok {
+                        last_total_bytes = 0;
+                        last_growth = std::time::Instant::now();
+                    }
+                    // 主动续流失败不立即 finalize（URL 未必真断，等被动分支兜底）
+                }
+            }
+
             // 2. ffmpeg 进程已退出？
             // 被动续命：先尝试重新解析 URL + 重启 ffmpeg，重试耗尽才 finalize
             if !child_alive {
@@ -211,18 +269,10 @@ fn spawn_recording_watcher<R: Runtime>(
 
                 if current_attempts < max_attempts {
                     // 尝试续命：kill 死进程 → 重新解析 → 重启 ffmpeg
-                    let renew_ok = try_renew_recording(&room_id, &app, &state);
+                    // （renew_recording_stream 内部成功时会 emit recording_renewed）
+                    let renew_ok = renew_recording_stream(&room_id, &app, &state, false);
 
                     if renew_ok {
-                        // 续命成功：emit recording_renewed 让前端感知"正在续流"
-                        let _ = app.emit(
-                            "recording_renewed",
-                            json!({
-                                "room_id": room_id,
-                                "attempt": current_attempts + 1,
-                                "max_attempts": max_attempts,
-                            }),
-                        );
                         // 把这次检测的 last_growth 重置，避免触发 STALE_TIMEOUT
                         last_total_bytes = 0;
                         last_growth = std::time::Instant::now();
@@ -276,15 +326,10 @@ fn spawn_recording_watcher<R: Runtime>(
             }
 
             // 3. work_dir 文件大小 + 最近一次增长时间
+            //    递归扫描：根目录遗留分片 + 所有 genN 子目录分片（多代后 total 不会因切代下降）
             let total = work_dir_opt
                 .as_deref()
-                .and_then(|d| std::fs::read_dir(d).ok())
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len()))
-                        .sum::<u64>()
-                })
+                .map(|d| recursive_flv_bytes(d))
                 .unwrap_or(0);
 
             if total > last_total_bytes {
@@ -324,25 +369,40 @@ fn spawn_recording_watcher<R: Runtime>(
     });
 }
 
-/// 录制被动续命：重新解析 URL → 重新启动 ffmpeg → 替换 session.process。
+/// 通用续流：重新解析 URL → 新代目录重启 ffmpeg → 整体重启 detector。
 ///
-/// 调用时机：看护线程发现 ffmpeg 进程已退出，且尚未用尽重试次数。
+/// `proactive`：true = 主动续流（URL 即将过期，进程仍存活）；
+///             false = 被动续命（进程已死亡）。
 ///
-/// 关键设计：分片路径保持不变（work_dir），新 ffmpeg 继续往同一个 `seg_%03d.flv` 写，
-/// ffmpeg 的 segment muxer 会自动从已有分片编号 + 1 续写（如果分片已存在则递增编号）。
-/// 这样续命产生的所有分片会被 stop_and_finalize 一次性合并，无需分代管理。
+/// 多代分片：每次续流 `session.generation += 1`，分片写到 `work_dir/gen{N}/`，
+/// 彻底规避 ffmpeg segment muxer 对同名分片的覆盖问题。
 ///
-/// 异步实现：因为 re-resolve 要走 HTTP，新工作线程内跑 tokio runtime。
-fn try_renew_recording<R: Runtime>(
+/// 孤儿防护：若续流过程中 session 被移除（用户停止 / monitor 下播），
+/// 必须 kill 已 spawn 的新 ffmpeg，防止孤儿进程继续写已删除的目录。
+fn renew_recording_stream<R: Runtime>(
     room_id: &str,
     app: &AppHandle<R>,
     state: &Arc<Mutex<AppState>>,
+    proactive: bool,
 ) -> bool {
     use std::process::Command;
-    use tauri::Manager;
 
-    // 1. 拿出 session 信息（work_dir / mode / cfg）
-    let (work_dir, mode, cfg_clone) = {
+    // 0. 标记 renewing（防主动/被动并发重入）
+    {
+        let mut st = state.lock().unwrap();
+        match st.recordings.get_mut(room_id) {
+            Some(session) => {
+                if session.renewing {
+                    return false; // 已有续流在进行
+                }
+                session.renewing = true;
+            }
+            None => return false, // session 已不存在
+        }
+    }
+
+    // 1. 拿出 session 信息
+    let (work_dir, mode, cfg_clone, gen_before) = {
         let st = state.lock().unwrap();
         let Some(session) = st.recordings.get(room_id) else {
             return false;
@@ -351,10 +411,19 @@ fn try_renew_recording<R: Runtime>(
             session.work_dir.clone(),
             session.mode.clone(),
             st.config.clone(),
+            session.generation,
         )
     };
+    if mode != "stream" {
+        // screen 模式不续流；恢复 renewing
+        let mut st = state.lock().unwrap();
+        if let Some(s) = st.recordings.get_mut(room_id) {
+            s.renewing = false;
+        }
+        return false;
+    }
 
-    // 2. 同步重新解析：开临时 tokio runtime 跑 async resolve
+    // 2. 重新解析 URL（6s 超时）
     let new_url = match std::thread::spawn({
         let room_id = room_id.to_string();
         let state = state.clone();
@@ -366,7 +435,6 @@ fn try_renew_recording<R: Runtime>(
             use crate::stream_resolver::resolve;
             let re_url = format!("https://live.douyin.com/{}", room_id);
             let resolve_future = resolve(&re_url);
-            // block_on + .await：先在 runtime 上阻塞运行 future
             let resolved = rt.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(6), resolve_future)
                     .await
@@ -374,7 +442,6 @@ fn try_renew_recording<R: Runtime>(
                     .map_err(|e| format!("解析失败: {}", e))
             })?;
 
-            // 回写 room.stream_url
             let mut st = state.lock().unwrap();
             if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
                 room.stream_url = Some(resolved.flv.clone());
@@ -384,7 +451,6 @@ fn try_renew_recording<R: Runtime>(
             }
             let _ = crate::config::save_config(&st.config);
 
-            // 校验是真实流地址
             if !crate::stream_resolver::is_stream_url(&resolved.flv) {
                 return Err("解析未拿到流地址".to_string());
             }
@@ -396,13 +462,30 @@ fn try_renew_recording<R: Runtime>(
         Ok(Ok(url)) => url,
         Ok(Err(e)) => {
             eprintln!("[renew] 重新解析 URL 失败：{}", e);
+            let mut st = state.lock().unwrap();
+            if let Some(s) = st.recordings.get_mut(room_id) {
+                s.renewing = false;
+            }
             return false;
         }
-        Err(_) => return false,
+        Err(_) => {
+            let mut st = state.lock().unwrap();
+            if let Some(s) = st.recordings.get_mut(room_id) {
+                s.renewing = false;
+            }
+            return false;
+        }
     };
 
-    // 3. 启动新 ffmpeg（stream 模式专属；screen 模式不需要续流）
-    if mode != "stream" {
+    // 3. 新代目录 + 启动新 ffmpeg
+    let new_gen = gen_before.saturating_add(1);
+    let gen_dir = work_dir.join(format!("gen{}", new_gen));
+    if let Err(e) = std::fs::create_dir_all(&gen_dir) {
+        eprintln!("[renew] 创建 gen{} 目录失败: {}", new_gen, e);
+        let mut st = state.lock().unwrap();
+        if let Some(s) = st.recordings.get_mut(room_id) {
+            s.renewing = false;
+        }
         return false;
     }
 
@@ -414,7 +497,7 @@ fn try_renew_recording<R: Runtime>(
     let stderr_log = work_dir.join("ffmpeg_stderr.log");
     let _ = std::fs::File::create(&stderr_log);
     let seg_time = cfg_clone.segment_minutes.max(1) * 60;
-    let out_tmpl = work_dir.join("seg_%03d.flv");
+    let out_tmpl = gen_dir.join("seg_%03d.flv");
 
     let args = vec![
         "-y".to_string(),
@@ -461,24 +544,91 @@ fn try_renew_recording<R: Runtime>(
         Ok(c) => c,
         Err(e) => {
             eprintln!("[renew] 重新启动 ffmpeg 失败：{}", e);
+            let mut st = state.lock().unwrap();
+            if let Some(s) = st.recordings.get_mut(room_id) {
+                s.renewing = false;
+            }
             return false;
         }
     };
 
-    // 4. 替换 session.process + 更新 current_url
-    let mut st = state.lock().unwrap();
-    if let Some(session) = st.recordings.get_mut(room_id) {
-        // kill 旧的（应该是已死进程，但保险）
-        if let Some(mut old) = session.process.take() {
-            let _ = old.kill();
-            let _ = old.wait();
+    // 4. 替换 session.process + 更新 current_url / generation
+    //    孤儿防护：session 已不存在 → kill 新 child
+    {
+        let mut st = state.lock().unwrap();
+        match st.recordings.get_mut(room_id) {
+            Some(session) => {
+                if let Some(mut old) = session.process.take() {
+                    let _ = old.kill();
+                    let _ = old.wait();
+                }
+                session.process = Some(new_child);
+                session.current_url = new_url.clone();
+                session.generation = new_gen;
+                session.renew_attempts = 0;
+                session.last_renew_at = now_ts();
+                session.renewing = false;
+            }
+            None => {
+                // 会话已移除：kill 新 child 防孤儿
+                let mut c = new_child;
+                let _ = c.kill();
+                let _ = c.wait();
+                return false;
+            }
         }
-        session.process = Some(new_child);
-        session.current_url = new_url.clone();
-        // 重置续流计数（在循环下一轮文件增长时会被清零；这里保守地清零）
-        session.renew_attempts = 0;
     }
-    let _ = app; // 当前未用到 app，但签名保留以便后续 emit 详细状态
+
+    // 5. 整体重启 detector（python stdin 绑定 ffmpeg stdout 无法热替换 → kill 旧重建）
+    //    坐立状态机重启可接受（续流频率 ~20 分钟一次）
+    //    保持原 detector 的 armed_start 语义（监控模式=true 循环，立即录制=false 不循环）
+    {
+        let mut st = state.lock().unwrap();
+        let armed = st
+            .detectors
+            .get(room_id)
+            .map(|d| d.armed_start)
+            .unwrap_or(false);
+        if let Some(mut old_det) = st.detectors.remove(room_id) {
+            old_det.stop();
+        }
+        st.logic.remove(room_id);
+        let cfg = st.config.clone();
+        let room = st.config.rooms.iter().find(|r| r.id == room_id).cloned();
+        drop(st);
+        if cfg.detect_enabled {
+            let (source, mode2) = resolve_source(room_id, &cfg, room.as_ref());
+            if let Ok(h) = crate::detector::spawn_detector(
+                room_id.to_string(),
+                source,
+                mode2,
+                cfg.sensitivity,
+                cfg.sit_stop_seconds,
+                armed, // 保持原语义
+                cfg.python_path.clone(),
+                app.clone(),
+                state.clone(),
+            ) {
+                state.lock().unwrap().detectors.insert(room_id.to_string(), h);
+            }
+        }
+    }
+
+    eprintln!(
+        "[renew] {} 续流成功（{}）gen{} -> gen{}",
+        room_id,
+        if proactive { "主动" } else { "被动" },
+        gen_before,
+        new_gen
+    );
+    let _ = app.emit(
+        "recording_renewed",
+        json!({
+            "room_id": room_id,
+            "proactive": proactive,
+            "generation": new_gen,
+        }),
+    );
     true
 }
 
@@ -553,14 +703,40 @@ fn start_ffmpeg(
 
     let args: Vec<String>;
     let stream_url: String;
+    // 分片输出代目录：默认 gen0；若根目录有遗留旧分片（legacy），迁到 gen0 并从 gen1 开始
+    let mut start_gen: u32 = 0;
     if mode == "stream" {
+        // 迁移遗留分片：旧版（无 gen 子目录）直接写 work 根目录，新录制前挪到 gen0 保留数据
+        let legacy: Vec<PathBuf> = std::fs::read_dir(&work)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension().map(|x| x == "flv").unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !legacy.is_empty() {
+            let gen0_dir = work.join("gen0");
+            let _ = std::fs::create_dir_all(&gen0_dir);
+            for f in legacy {
+                let name = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let _ = std::fs::rename(&f, gen0_dir.join(name));
+            }
+            start_gen = 1; // 新录制从 gen1 开始，避免与迁移的 gen0 覆盖
+        }
+
         let url = room
             .and_then(|r| r.stream_url.clone())
             .or_else(|| resolve_stream_url(room_id))
             .ok_or_else(|| anyhow!("房间 {} 未配置直播流地址", room_id))?;
         stream_url = url.clone();
         let seg_time = cfg.segment_minutes.max(1) * 60;
-        let out_tmpl = work.join("seg_%03d.flv");
+        let out_dir = work.join(format!("gen{}", start_gen));
+        std::fs::create_dir_all(&out_dir)?;
+        let out_tmpl = out_dir.join("seg_%03d.flv");
         args = vec![
             "-y".into(),
             "-v".into(), "info".into(),
@@ -639,7 +815,7 @@ fn start_ffmpeg(
 
     // 再等 3 秒检查：ffmpeg 进程是活着的，且 seg_000.flv 有没有开始收到数据？
     std::thread::sleep(std::time::Duration::from_millis(3000));
-    let seg_file = work.join("seg_000.flv");
+    let seg_file = work.join(format!("gen{}", start_gen)).join("seg_000.flv");
     let has_data = seg_file
         .metadata()
         .map(|m| m.len() > 0)
@@ -676,6 +852,9 @@ fn start_ffmpeg(
         started_at: now_ts(),
         renew_attempts: 0,
         current_url: stream_url,
+        generation: start_gen,
+        last_renew_at: 0,
+        renewing: false,
     })
 }
 
@@ -798,13 +977,24 @@ fn ffmpeg_exit_error(
 }
 
 /// 收集有效分片文件（阈值 1KB：排除 0 字节空壳文件，保留任何有内容的数据）
-fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
+///
+/// 多代收集顺序（时间有序）：
+///   1. 根目录遗留分片（legacy，旧版直接写根目录的数据）
+///   2. gen0 → gen1 → gen2 ...（按目录名数字排序），各自内部按文件名排序
+/// 显式排除产物文件：merged.flv / concat.txt / ffmpeg_stderr.log
+pub(crate) fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if session.mode == "stream" {
+        // 1. 根目录遗留分片（排除 merged.flv 产物）
         if let Ok(entries) = std::fs::read_dir(&session.work_dir) {
             for e in entries.flatten() {
                 let p = e.path();
-                if p.extension().map(|x| x == "flv").unwrap_or(false) {
+                if p.is_file()
+                    && p.extension().map(|x| x == "flv").unwrap_or(false)
+                    && p.file_name()
+                        .map(|n| n != "merged.flv")
+                        .unwrap_or(false)
+                {
                     if let Ok(meta) = std::fs::metadata(&p) {
                         if meta.len() > 1_024 {
                             files.push(p);
@@ -814,6 +1004,41 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
             }
         }
         files.sort();
+
+        // 2. genN 子目录分片（按数字排序，时间有序）
+        let mut gen_dirs: Vec<(u32, PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&session.work_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                if let Some(n) = name.strip_prefix("gen") {
+                    if let Ok(idx) = n.parse::<u32>() {
+                        gen_dirs.push((idx, p));
+                    }
+                }
+            }
+        }
+        gen_dirs.sort_by_key(|(idx, _)| *idx);
+        for (_, dir) in gen_dirs {
+            let mut segs: Vec<PathBuf> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().map(|x| x == "flv").unwrap_or(false) {
+                        if let Ok(meta) = std::fs::metadata(&p) {
+                            if meta.len() > 1_024 {
+                                segs.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+            segs.sort();
+            files.extend(segs);
+        }
     } else {
         let f = session.work_dir.join("rec.mp4");
         if f.exists() {

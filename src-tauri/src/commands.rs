@@ -542,29 +542,35 @@ pub fn list_pending_recordings(state: State<SharedState>) -> Vec<crate::types::P
             if !name.starts_with("._work_") {
                 continue;
             }
-            // 扫描 work_dir 内的 flv/mp4 分片
+            // 扫描 work_dir 内的 flv/mp4 分片（递归：含多代 genN 子目录）
             let mut segments = Vec::new();
             let mut total: u64 = 0;
             let mut earliest: i64 = i64::MAX;
-            if let Ok(subs) = std::fs::read_dir(&p) {
-                for s in subs.flatten() {
-                    let sp = s.path();
-                    let ext_ok = sp
-                        .extension()
-                        .map(|x| x == "flv" || x == "mp4")
-                        .unwrap_or(false);
-                    if !ext_ok {
-                        continue;
-                    }
-                    if let Ok(m) = s.metadata() {
-                        if m.len() > 10_240 {
-                            segments.push(sp.clone());
-                            total += m.len();
-                            if let Ok(modified) = m.modified() {
-                                if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
-                                    let ts = d.as_secs() as i64;
-                                    if ts < earliest {
-                                        earliest = ts;
+            fn scan_dir(dir: &std::path::Path, segments: &mut Vec<std::path::PathBuf>, total: &mut u64, earliest: &mut i64) {
+                if let Ok(subs) = std::fs::read_dir(dir) {
+                    for s in subs.flatten() {
+                        let sp = s.path();
+                        if sp.is_dir() {
+                            scan_dir(&sp, segments, total, earliest);
+                            continue;
+                        }
+                        let ext_ok = sp
+                            .extension()
+                            .map(|x| x == "flv" || x == "mp4")
+                            .unwrap_or(false);
+                        if !ext_ok {
+                            continue;
+                        }
+                        if let Ok(m) = s.metadata() {
+                            if m.len() > 10_240 {
+                                segments.push(sp.clone());
+                                *total += m.len();
+                                if let Ok(modified) = m.modified() {
+                                    if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+                                        let ts = d.as_secs() as i64;
+                                        if ts < *earliest {
+                                            *earliest = ts;
+                                        }
                                     }
                                 }
                             }
@@ -572,6 +578,7 @@ pub fn list_pending_recordings(state: State<SharedState>) -> Vec<crate::types::P
                     }
                 }
             }
+            scan_dir(&p, &mut segments, &mut total, &mut earliest);
             if segments.is_empty() {
                 continue;
             }
