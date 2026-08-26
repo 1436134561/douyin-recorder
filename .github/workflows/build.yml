@@ -92,13 +92,40 @@ jobs:
       - name: Package Portable (no-install zip)
         shell: pwsh
         run: |
+          # 健壮性检查：每个源都验证存在并给出明确的 ::error:: 诊断
+          # （这样即使日志下载被网络拦截，run 页面也能看到失败原因）
           $portable = "portable/douyin-recorder"
           New-Item -ItemType Directory -Path $portable -Force
-          Copy-Item src-tauri/target/release/douyin-recorder.exe -Destination "$portable/douyin-recorder.exe" -Force
+
+          $exe = "src-tauri/target/release/douyin-recorder.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "::error::找不到构建产物 $exe。target/release 内容："
+            Get-ChildItem src-tauri/target/release -ErrorAction SilentlyContinue | Select-Object Name,Length | Format-Table
+            exit 1
+          }
+          Copy-Item $exe -Destination "$portable/douyin-recorder.exe" -Force
+
+          if (-not (Test-Path python-runtime)) {
+            Write-Error "::error::找不到 python-runtime 目录"
+            exit 1
+          }
           Copy-Item python-runtime -Destination "$portable/python" -Recurse -Force
+
+          if (-not (Test-Path ffmpeg/ffmpeg.exe)) {
+            Write-Error "::error::找不到 ffmpeg/ffmpeg.exe（Bundle ffmpeg 步骤可能未生成）"
+            Get-ChildItem ffmpeg -ErrorAction SilentlyContinue | Select-Object Name,Length | Format-Table
+            exit 1
+          }
           Copy-Item ffmpeg -Destination "$portable/ffmpeg" -Recurse -Force
-          Compress-Archive -Path "$portable/*" -DestinationPath "douyin-recorder-portable.zip" -Force
+
+          try {
+            Compress-Archive -Path "$portable/*" -DestinationPath "douyin-recorder-portable.zip" -Force
+          } catch {
+            Write-Error "::error::Compress-Archive 失败: $($_.Exception.Message)"
+            exit 1
+          }
           Remove-Item portable -Recurse -Force
+          Write-Host "✅ 便携版打包完成: $(Get-Item douyin-recorder-portable.zip).Length bytes"
 
       - name: Upload setup artifact
         uses: actions/upload-artifact@v4
