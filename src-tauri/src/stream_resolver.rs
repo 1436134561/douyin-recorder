@@ -933,3 +933,58 @@ mod tests {
         assert_eq!(result.unwrap(), "{\"app\":{}}");
     }
 }
+
+// ─── 公开辅助：FLV URL 过期时间 + 续流用工具 ───
+
+/// 简单 unix 时间戳（秒），避免引入 chrono 依赖。
+/// 在 stream_resolver 里只是兜底计算，过期时间精度不重要。
+fn chrono_like_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 从 FLV URL 的查询参数里提取绝对过期时间（Unix 秒）。
+///
+/// 抖音 URL 通常带 `expire=1787237249` 或 `t=...&expires=...`。
+/// 用于看护线程在 URL 失效前主动重新解析 + 重启 ffmpeg。
+/// 返回 None 时说明无法从 URL 推断过期时间（调用方应退回到定期重解析策略）。
+pub fn flv_expiry_secs(url: &str) -> Option<i64> {
+    let q = url.split_once('?')?.1;
+    let mut expire: Option<i64> = None;
+    let mut fallback: Option<i64> = None;
+    for pair in q.split('&') {
+        let (k, v) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        match k {
+            "expire" | "expires" | "Expires" => {
+                if let Ok(n) = v.parse::<i64>() {
+                    if n > 1_000_000_000 {
+                        // 绝对秒（2025+ 之后都是这种）
+                        expire = Some(n);
+                    } else {
+                        // 相对秒（兜底，加上 1800 = 30 分钟作为过期时间）
+                        fallback = Some(1800);
+                    }
+                }
+            }
+            "t" => {
+                if expire.is_none() {
+                    if let Ok(n) = v.parse::<i64>() {
+                        if n > 1_000_000_000 {
+                            expire = Some(n);
+                        } else {
+                            fallback = Some(1800);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    expire.or(fallback.map(|r| chrono_like_now() + r))
+}

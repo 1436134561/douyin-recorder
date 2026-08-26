@@ -25,6 +25,11 @@ pub struct RecordingSession {
     pub process: Option<std::process::Child>,
     #[allow(dead_code)]
     pub started_at: i64,
+    /// URL 失效自动续流的重试计数。renew 成功就清零；累计超过 cfg.max_renew_attempts
+    /// 才走 finalize_partial_or_cleanup（→ emit recording_failed）。
+    pub renew_attempts: u32,
+    /// 当前正在使用的 FLV URL（用于续流时校验/复用）。
+    pub current_url: String,
 }
 
 fn now_ts() -> i64 {
@@ -191,14 +196,83 @@ fn spawn_recording_watcher<R: Runtime>(
             }
 
             // 2. ffmpeg 进程已退出？
+            // 被动续命：先尝试重新解析 URL + 重启 ffmpeg，重试耗尽才 finalize
             if !child_alive {
-                finalize_partial_or_cleanup(
-                    &room_id,
-                    "录制进程已退出（可能：流地址失效、主播下播、网络断开）",
-                    &app,
-                    &state,
-                );
-                break;
+                let (max_attempts, current_attempts) = {
+                    let st = state.lock().unwrap();
+                    let max = st.config.max_renew_attempts;
+                    let cur = st
+                        .recordings
+                        .get(&room_id)
+                        .map(|s| s.renew_attempts)
+                        .unwrap_or(99);
+                    (max, cur)
+                };
+
+                if current_attempts < max_attempts {
+                    // 尝试续命：kill 死进程 → 重新解析 → 重启 ffmpeg
+                    let renew_ok = try_renew_recording(&room_id, &app, &state);
+
+                    if renew_ok {
+                        // 续命成功：emit recording_renewed 让前端感知"正在续流"
+                        let _ = app.emit(
+                            "recording_renewed",
+                            json!({
+                                "room_id": room_id,
+                                "attempt": current_attempts + 1,
+                                "max_attempts": max_attempts,
+                            }),
+                        );
+                        // 把这次检测的 last_growth 重置，避免触发 STALE_TIMEOUT
+                        last_total_bytes = 0;
+                        last_growth = std::time::Instant::now();
+                        // 不 break，继续循环监控
+                    } else {
+                        // 续命也失败：累加重试
+                        let next_attempts = {
+                            let mut st = state.lock().unwrap();
+                            if let Some(s) = st.recordings.get_mut(&room_id) {
+                                s.renew_attempts += 1;
+                                s.renew_attempts
+                            } else {
+                                max_attempts // session 已不在了，强制退出
+                            }
+                        };
+                        let _ = app.emit(
+                            "recording_failed",
+                            json!({
+                                "room_id": room_id,
+                                "reason": format!("录制断流，自动续流失败（{}/{} 次）", next_attempts, max_attempts),
+                                "renew_attempt": next_attempts,
+                                "max_attempts": max_attempts,
+                            }),
+                        );
+                        if next_attempts >= max_attempts {
+                            finalize_partial_or_cleanup(
+                                &room_id,
+                                &format!(
+                                    "录制断流且自动续流已用尽（{} 次）。可能：主播下播、房间已封禁、网络彻底断开",
+                                    max_attempts
+                                ),
+                                &app,
+                                &state,
+                            );
+                            break;
+                        }
+                        // 还没用尽：等待一会儿让用户感知到，再继续下一轮循环
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                    }
+                } else {
+                    // 已超过最大重试，直接收尾
+                    finalize_partial_or_cleanup(
+                        &room_id,
+                        "录制进程已退出，且自动续流已用尽最大重试次数",
+                        &app,
+                        &state,
+                    );
+                    break;
+                }
+                continue;
             }
 
             // 3. work_dir 文件大小 + 最近一次增长时间
@@ -216,7 +290,17 @@ fn spawn_recording_watcher<R: Runtime>(
             if total > last_total_bytes {
                 last_total_bytes = total;
                 last_growth = std::time::Instant::now();
-            } else if total == 0 {
+            }
+            // 网络健康：主动重置续流计数（防止短时波动后无谓累加）
+            {
+                let mut st = state.lock().unwrap();
+                if let Some(s) = st.recordings.get_mut(&room_id) {
+                    if s.renew_attempts > 0 {
+                        s.renew_attempts = 0;
+                    }
+                }
+            }
+            if total == 0 {
                 // 启动后 NO_DATA_TIMEOUT 秒内没数据就算早期失效
                 if last_growth.elapsed() > NO_DATA_TIMEOUT {
                     finalize_partial_or_cleanup(
@@ -238,6 +322,164 @@ fn spawn_recording_watcher<R: Runtime>(
             }
         }
     });
+}
+
+/// 录制被动续命：重新解析 URL → 重新启动 ffmpeg → 替换 session.process。
+///
+/// 调用时机：看护线程发现 ffmpeg 进程已退出，且尚未用尽重试次数。
+///
+/// 关键设计：分片路径保持不变（work_dir），新 ffmpeg 继续往同一个 `seg_%03d.flv` 写，
+/// ffmpeg 的 segment muxer 会自动从已有分片编号 + 1 续写（如果分片已存在则递增编号）。
+/// 这样续命产生的所有分片会被 stop_and_finalize 一次性合并，无需分代管理。
+///
+/// 异步实现：因为 re-resolve 要走 HTTP，新工作线程内跑 tokio runtime。
+fn try_renew_recording<R: Runtime>(
+    room_id: &str,
+    app: &AppHandle<R>,
+    state: &Arc<Mutex<AppState>>,
+) -> bool {
+    use std::process::Command;
+    use tauri::Manager;
+
+    // 1. 拿出 session 信息（work_dir / mode / cfg）
+    let (work_dir, mode, cfg_clone) = {
+        let st = state.lock().unwrap();
+        let Some(session) = st.recordings.get(room_id) else {
+            return false;
+        };
+        (
+            session.work_dir.clone(),
+            session.mode.clone(),
+            st.config.clone(),
+        )
+    };
+
+    // 2. 同步重新解析：开临时 tokio runtime 跑 async resolve
+    let new_url = match std::thread::spawn({
+        let room_id = room_id.to_string();
+        let state = state.clone();
+        move || -> Result<String, String> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("tokio runtime 创建失败: {}", e))?;
+            use crate::stream_resolver::resolve;
+            let re_url = format!("https://live.douyin.com/{}", room_id);
+            let resolve_future = resolve(&re_url);
+            // block_on + .await：先在 runtime 上阻塞运行 future
+            let resolved = rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(6), resolve_future)
+                    .await
+                    .map_err(|_| "解析超时（6 秒）".to_string())?
+                    .map_err(|e| format!("解析失败: {}", e))
+            })?;
+
+            // 回写 room.stream_url
+            let mut st = state.lock().unwrap();
+            if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
+                room.stream_url = Some(resolved.flv.clone());
+                room.name = resolved.meta.as_ref().and_then(|m| {
+                    if m.nickname.is_empty() { None } else { Some(m.nickname.clone()) }
+                });
+            }
+            let _ = crate::config::save_config(&st.config);
+
+            // 校验是真实流地址
+            if !crate::stream_resolver::is_stream_url(&resolved.flv) {
+                return Err("解析未拿到流地址".to_string());
+            }
+            Ok(resolved.flv)
+        }
+    })
+    .join()
+    {
+        Ok(Ok(url)) => url,
+        Ok(Err(e)) => {
+            eprintln!("[renew] 重新解析 URL 失败：{}", e);
+            return false;
+        }
+        Err(_) => return false,
+    };
+
+    // 3. 启动新 ffmpeg（stream 模式专属；screen 模式不需要续流）
+    if mode != "stream" {
+        return false;
+    }
+
+    let ffmpeg_bin = ffmpeg_executable();
+    let ffmpeg_dir = std::path::Path::new(&ffmpeg_bin)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stderr_log = work_dir.join("ffmpeg_stderr.log");
+    let _ = std::fs::File::create(&stderr_log);
+    let seg_time = cfg_clone.segment_minutes.max(1) * 60;
+    let out_tmpl = work_dir.join("seg_%03d.flv");
+
+    let args = vec![
+        "-y".to_string(),
+        "-v".to_string(),
+        "info".to_string(),
+        "-rw_timeout".to_string(),
+        "15000000".to_string(),
+        "-timeout".to_string(),
+        "15000000".to_string(),
+        "-i".to_string(),
+        new_url.clone(),
+        "-c".to_string(),
+        "copy".to_string(),
+        "-f".to_string(),
+        "segment".to_string(),
+        "-segment_time".to_string(),
+        seg_time.to_string(),
+        "-segment_format".to_string(),
+        "flv".to_string(),
+        "-reset_timestamps".to_string(),
+        "1".to_string(),
+        "-reconnect".to_string(),
+        "1".to_string(),
+        "-reconnect_streamed".to_string(),
+        "1".to_string(),
+        "-reconnect_delay_max".to_string(),
+        "5".to_string(),
+        out_tmpl.to_string_lossy().into(),
+    ];
+
+    let mut cmd = Command::new(&ffmpeg_bin);
+    cmd.args(&args)
+        .current_dir(&ffmpeg_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(
+            match std::fs::File::options().append(true).open(&stderr_log) {
+                Ok(f) => std::process::Stdio::from(f),
+                Err(_) => std::process::Stdio::null(),
+            },
+        );
+    #[cfg(windows)]
+    { cmd.creation_flags(0x08000000); }
+    let new_child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[renew] 重新启动 ffmpeg 失败：{}", e);
+            return false;
+        }
+    };
+
+    // 4. 替换 session.process + 更新 current_url
+    let mut st = state.lock().unwrap();
+    if let Some(session) = st.recordings.get_mut(room_id) {
+        // kill 旧的（应该是已死进程，但保险）
+        if let Some(mut old) = session.process.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+        session.process = Some(new_child);
+        session.current_url = new_url.clone();
+        // 重置续流计数（在循环下一轮文件增长时会被清零；这里保守地清零）
+        session.renew_attempts = 0;
+    }
+    let _ = app; // 当前未用到 app，但签名保留以便后续 emit 详细状态
+    true
 }
 
 /// 看护触发时调用：先尝试用 stop_and_finalize 保存部分分片（不丢数据），
@@ -309,16 +551,21 @@ fn start_ffmpeg(
     let stderr_log = work.join("ffmpeg_stderr.log");
     let _ = std::fs::File::create(&stderr_log);
 
-    let args: Vec<String> = if mode == "stream" {
+    let args: Vec<String>;
+    let stream_url: String;
+    if mode == "stream" {
         let url = room
             .and_then(|r| r.stream_url.clone())
             .or_else(|| resolve_stream_url(room_id))
             .ok_or_else(|| anyhow!("房间 {} 未配置直播流地址", room_id))?;
+        stream_url = url.clone();
         let seg_time = cfg.segment_minutes.max(1) * 60;
         let out_tmpl = work.join("seg_%03d.flv");
-        vec![
+        args = vec![
             "-y".into(),
             "-v".into(), "info".into(),
+            "-rw_timeout".into(), "15000000".into(),  // 15s 网络超时（微秒）：断流/403 快速失败，避免挂死
+            "-timeout".into(), "15000000".into(),     // 协议层超时同上
             "-i".into(), url,
             "-c".into(), "copy".into(),
             "-f".into(), "segment".into(),
@@ -332,11 +579,12 @@ fn start_ffmpeg(
             "-reconnect_streamed".into(), "1".into(),
             "-reconnect_delay_max".into(), "5".into(),
             out_tmpl.to_string_lossy().into(),
-        ]
+        ];
     } else {
+        stream_url = String::new();  // screen 模式不需要 URL
         let src = cfg.screen_source.clone().unwrap_or_else(|| "desktop".into());
         let out_file = work.join("rec.mp4");
-        vec![
+        args = vec![
             "-y".into(),
             "-v".into(), "info".into(),
             "-f".into(), "gdigrab".into(),
@@ -347,8 +595,8 @@ fn start_ffmpeg(
             "-pix_fmt".into(), "yuv420p".into(),
             "-f".into(), "mp4".into(),
             out_file.to_string_lossy().into(),
-        ]
-    };
+        ];
+    }
 
     // 直接 spawn ffmpeg（不用 cmd /c 包装）。
     // 关键：Rust Command::new(bin).args(args) 在 Windows 上用 CreateProcessW 标准引号规则，
@@ -426,6 +674,8 @@ fn start_ffmpeg(
         work_dir: work,
         process: Some(child),
         started_at: now_ts(),
+        renew_attempts: 0,
+        current_url: stream_url,
     })
 }
 

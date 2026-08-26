@@ -56,10 +56,21 @@ pub struct AppConfig {
     /// 太短（<20s）可能触发风控；太长（>120s）开播延迟感知差。
     #[serde(default = "default_30")]
     pub monitor_poll_secs: u64,
+    /// 录制中 URL 过期时自动重新解析的「提前秒数」。
+    /// 看护线程在 URL expire - lead_secs 时主动重新解析 + 重启 ffmpeg，
+    /// 从源头避免「断流 → 录像自动停」。
+    /// 推荐 120 秒（URL 一般 20 分钟有效，提前 2 分钟重解析留出缓冲）。
+    #[serde(default = "default_renew_lead")]
+    pub url_renew_lead_secs: u64,
+    /// URL 失效自动续流的最大重试次数（被动续命）。重试用尽才 emit recording_failed。
+    #[serde(default = "default_max_renew")]
+    pub max_renew_attempts: u32,
 }
 
 fn default_true() -> bool { true }
 fn default_30() -> u64 { 30 }
+fn default_renew_lead() -> u64 { 120 }
+fn default_max_renew() -> u32 { 3 }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -80,6 +91,8 @@ impl Default for AppConfig {
             python_path: None,
             rooms: vec![],
             monitor_poll_secs: 30,
+            url_renew_lead_secs: 120,
+            max_renew_attempts: 3,
         }
     }
 }

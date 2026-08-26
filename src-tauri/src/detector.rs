@@ -120,7 +120,15 @@ pub fn spawn_detector<R: Runtime>(
             source.clone(),
         ]);
     } else {
-        ffmpeg_args.extend(["-i".into(), source.clone()]);
+        // 网络流：加超时让断流快速失败（避免 python 端永远等不到 EOF）
+        ffmpeg_args.extend([
+            "-rw_timeout".into(),
+            "15000000".into(),  // 15s 网络读超时（微秒）
+            "-timeout".into(),
+            "15000000".into(),  // 协议层超时同上
+            "-i".into(),
+            source.clone(),
+        ]);
     }
     ffmpeg_args.extend([
         "-vf".into(),

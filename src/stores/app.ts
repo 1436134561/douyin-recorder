@@ -117,6 +117,14 @@ export const useStore = defineStore('app', () => {
       refreshPending()
       notify('err', `录制已自动停止（${e.room_id}）：${e.reason}`)
     })
+    api.on('recording_renewed', (p) => {
+      // 后端检测到 ffmpeg 死亡 → 自动重新解析 URL + 重启成功
+      // 前端仅给提示，不刷新 statuses（recording 一直是 true）
+      const e = p as { room_id: string; attempt: number; max_attempts: number }
+      notify('ok', `录制自动续流成功（${e.room_id}，第 ${e.attempt}/${e.max_attempts} 次）`)
+      // 兜底刷新一次：保险
+      refreshStatuses()
+    })
     api.on('detection_event', (p) => {
       const e = p as DetectionEvent
       detections[e.room_id] = e

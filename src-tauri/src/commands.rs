@@ -371,29 +371,62 @@ async fn resolve_room_stream_if_needed(
     room_id: &str,
     state: &State<'_, SharedState>,
 ) -> Result<(), String> {
+    resolve_fresh_flv(room_id, state).await.map(|_| ())
+}
+
+/// 重新解析抖音直播间 URL，返回新鲜 FLV 地址。
+/// 内部走 resolve()，成功回写 room.stream_url。
+/// 供 commands / recorder 看护线程 / monitor 共用——任何需要"新鲜 URL"的地方。
+pub async fn resolve_fresh_flv(
+    room_id: &str,
+    state: &State<'_, SharedState>,
+) -> Result<String, String> {
     let re_url = format!("https://live.douyin.com/{}", room_id);
+    do_resolve_and_save(&re_url, room_id, state).await?;
 
-    // 修复 Bug C：去掉 `let _ =`，解析失败立即向上抛
-    // resolve() 现在自带详细错误信息（各策略失败原因），这里只需直接传播
-    if let Err(e) = do_resolve_and_save(&re_url, room_id, state).await {
-        return Err(e);
-    }
-
-    // 二次校验：解析成功也确保 stream_url 字段被实际写入了
-    let has_stream = {
+    let url = {
         let st = state.lock().unwrap();
         st.config
             .rooms
             .iter()
             .find(|r| r.id == room_id)
             .and_then(|r| r.stream_url.clone())
-            .map(|url| crate::stream_resolver::is_stream_url(&url))
-            .unwrap_or(false)
     };
-    if !has_stream {
-        return Err("未能获取到可用直播流地址，请确认主播正在直播".into());
+    url.ok_or_else(|| "未能获取到可用直播流地址，请确认主播正在直播".into())
+}
+
+/// resolve_fresh_flv 的同步版本，供 monitor 阻塞线程调用。
+/// 内部开 current_thread runtime 跑 async resolve（与 recorder::try_renew_recording 同样的模式）。
+pub fn resolve_fresh_flv_blocking(room_id: &str, state: &SharedState) -> Result<String, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime 创建失败: {}", e))?;
+    let re_url = format!("https://live.douyin.com/{}", room_id);
+    use crate::stream_resolver::resolve;
+    let resolved = rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(6), resolve(&re_url))
+            .await
+            .map_err(|_| "解析超时（6 秒）".to_string())?
+            .map_err(|e| format!("解析失败: {}", e))
+    })?;
+
+    // 回写 room.stream_url
+    {
+        let mut st = state.lock().unwrap();
+        if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
+            room.stream_url = Some(resolved.flv.clone());
+            room.name = resolved.meta.as_ref().and_then(|m| {
+                if m.nickname.is_empty() { None } else { Some(m.nickname.clone()) }
+            });
+        }
+        let _ = crate::config::save_config(&st.config);
     }
-    Ok(())
+
+    if !crate::stream_resolver::is_stream_url(&resolved.flv) {
+        return Err("解析未拿到流地址".to_string());
+    }
+    Ok(resolved.flv)
 }
 
 /// 执行解析并将结果回写到房间配置

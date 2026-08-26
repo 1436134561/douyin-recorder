@@ -99,6 +99,8 @@ mod tests {
                 python_path: None,
                 rooms: vec![],
                 monitor_poll_secs: 30,
+                url_renew_lead_secs: 120,
+                max_renew_attempts: 3,
             },
             recordings: Default::default(),
             detectors: Default::default(),

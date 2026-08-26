@@ -28,6 +28,8 @@ pub struct MonitorHandle {
 pub struct MonitorState {
     pub live: bool,
     pub last_poll_ts: i64,
+    /// 连续 live=false 计数（防抖：连续 2 次才 stop，避免风控/限流误杀）
+    pub live_false_count: u32,
 }
 
 /// 发往前端的 monitor_event payload
@@ -77,6 +79,7 @@ pub fn start<R: Runtime>(
                     MonitorState {
                         live,
                         last_poll_ts: poll_ts,
+                        live_false_count: if live { 0 } else { 1 },
                     },
                 );
             }
@@ -163,6 +166,38 @@ async fn drive_state_machine<R: Runtime>(
 
     if live {
         // 开播分支
+        // 关键修复：先重新解析 URL → 把新鲜 URL 写到 room.stream_url
+        // 这样 begin_recording 拿到的不是 config 里可能过期的旧 URL
+        // （修复 monitor 死锁：旧 URL 过期 → begin_recording 失败 → 永远无法重启）
+        let resolve_res = {
+            let st = state.clone();
+            let rid = room_id.to_string();
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::commands::resolve_fresh_flv_blocking(&rid, &st)
+            })
+            .await
+        };
+        match resolve_res {
+            Ok(Ok(_new_url)) => {
+                // 解析成功，room.stream_url 已被新值覆盖
+            }
+            Ok(Err(e)) => {
+                eprintln!("[monitor] 重新解析 URL 失败（开播分支继续尝试录制）: {}", e);
+                // 不返回 Err：解析失败也允许后续 begin_recording（用户可能手动填了 URL）
+            }
+            Err(e) => {
+                eprintln!("[monitor] resolve_fresh_flv join error: {}", e);
+            }
+        }
+
+        // 把探测到的 live=false_count 清零
+        {
+            let mut st = state.lock().unwrap();
+            if let Some(ms) = st.monitor_states.get_mut(room_id) {
+                ms.live_false_count = 0;
+            }
+        }
+
         let (need_spawn_detector, need_begin_recording) = {
             let st = state.lock().unwrap();
             let det_running = st
@@ -209,7 +244,22 @@ async fn drive_state_machine<R: Runtime>(
             }
         }
     } else {
-        // 下播分支
+        // 下播分支（防抖：连续 2 次 live=false 才 stop，避免风控/限流误杀健康录制）
+        let live_false_count: u32 = {
+            let mut st = state.lock().unwrap();
+            if let Some(ms) = st.monitor_states.get_mut(room_id) {
+                ms.live_false_count = ms.live_false_count.saturating_add(1);
+                ms.live_false_count
+            } else {
+                1
+            }
+        };
+        if live_false_count < 2 {
+            // 单次 false → 静默跳过（前端 monitor_event 仍会更新 live=false 显示）
+            // 下一轮再 false 才真正 stop
+            return Ok(());
+        }
+
         let (need_stop_recording, need_stop_detector) = {
             let mut st = state.lock().unwrap();
             // 注意：先收尾录制，再停 detector
