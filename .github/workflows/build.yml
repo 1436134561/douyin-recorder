@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+# 同一分支的新构建会取消旧的，避免重复占 runner
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest

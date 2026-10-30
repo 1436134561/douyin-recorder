@@ -836,10 +836,8 @@ pub fn finalize_work_dir(
     // 成功才清理工作目录
     let _ = std::fs::remove_dir_all(work_dir);
 
-    let mut id = name.clone();
-    if let Some(stripped) = id.strip_suffix(&format!(".{}", effective_fmt)) {
-        id = stripped.to_string();
-    }
+    let suffix = format!(".{}", effective_fmt);
+    let id = name.strip_suffix(&suffix).unwrap_or(&name).to_string();
     Ok(RecordingInfo {
         id,
         room_id: room_label.to_string(),
