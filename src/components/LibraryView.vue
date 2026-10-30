@@ -203,6 +203,33 @@ async function confirmCleanup(workDir: string) {
   await store.cleanupPending(workDir)
 }
 
+/** 正在恢复中的工作目录（按钮转圈 + 防重复点击） */
+const resuming = ref<string>('')
+
+async function confirmResume(workDir: string) {
+  const ok = await store.confirm({
+    title: '恢复为视频',
+    message:
+      '将把该目录里的分片合并、转成正式录像，然后自动清理残留目录。\n分片较多/较大时可能需要一会儿，请勿关闭程序。',
+    confirmText: '开始恢复',
+  })
+  if (!ok) return
+  resuming.value = workDir
+  try {
+    await store.resumePending(workDir)
+  } finally {
+    resuming.value = ''
+  }
+}
+
+async function revealDir(workDir: string) {
+  try {
+    await revealItemInDir(workDir)
+  } catch (e) {
+    store.notify('err', `打开文件夹失败：${e}`)
+  }
+}
+
 function switchTab(t: Tab) {
   activeTab.value = t
 }
@@ -303,14 +330,26 @@ function switchTab(t: Tab) {
 
     <!-- 等待中 -->
     <div v-else-if="activeTab === 'pending'" class="space-y-3">
+      <div class="card p-3.5 flex items-start gap-3 bg-amber-50/60 border-amber-100">
+        <Icon name="hourglass" class="text-amber-600 mt-0.5 shrink-0" />
+        <div class="text-xs text-amber-700 leading-relaxed flex-1">
+          <b>「等待中」是什么：</b>录制没有正常收尾时留下的原始分片（断流、程序被关掉、转码失败都会产生）。
+          点 <b>恢复为视频</b> 会把分片合并、转成正式录像并出现在「已完成」里；确认不需要了再点清理。
+        </div>
+        <button class="btn-ghost !px-2.5 shrink-0" title="刷新" @click="store.refreshPending()">
+          <Icon name="refresh" />
+        </button>
+      </div>
+
       <div v-if="pendingCount === 0" class="card p-10 text-center text-ink-400">
         当前没有残留的录制任务<br />
-        <span class="text-xs">转码失败或异常中断的分片会出现在这里，可清理或手动恢复</span>
+        <span class="text-xs">断流或异常中断留下的分片会出现在这里，可一键恢复成视频</span>
       </div>
+
       <div
         v-for="p in store.pendingRecordings"
         :key="p.work_dir"
-        class="card p-4 flex items-center gap-4"
+        class="card p-4 flex items-center gap-4 flex-wrap"
       >
         <div class="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
           <Icon name="hourglass" />
@@ -320,13 +359,32 @@ function switchTab(t: Tab) {
             房间 {{ p.room_id || '未知' }}
           </div>
           <div class="text-xs text-ink-400">
-            {{ p.segment_count }} 个分片 · {{ formatBytes(p.total_bytes) }} ·
-            <span class="font-mono text-[10px]">{{ p.work_dir }}</span>
+            {{ p.segment_count }} 个分片 · {{ formatBytes(p.total_bytes) }}
+            <span v-if="p.earliest_ts"> · {{ formatStamp(p.earliest_ts) }}</span>
+            · <span class="font-mono text-[10px]">{{ p.work_dir }}</span>
           </div>
         </div>
-        <button class="btn-soft text-rose-500" @click="confirmCleanup(p.work_dir)">
-          <Icon name="trash" /> 清理残留
-        </button>
+        <div class="flex items-center gap-2 shrink-0">
+          <button
+            class="btn-primary"
+            :disabled="!!resuming"
+            :title="'合并分片并转码为正式录像'"
+            @click="confirmResume(p.work_dir)"
+          >
+            <Icon :name="resuming === p.work_dir ? 'hourglass' : 'merge'" />
+            {{ resuming === p.work_dir ? '恢复中…' : '恢复为视频' }}
+          </button>
+          <button class="btn-soft" @click="revealDir(p.work_dir)">
+            <Icon name="folder" /> 打开文件夹
+          </button>
+          <button
+            class="btn-ghost !px-2.5 text-rose-500"
+            title="清理残留分片"
+            @click="confirmCleanup(p.work_dir)"
+          >
+            <Icon name="trash" />
+          </button>
+        </div>
       </div>
     </div>
 

@@ -1,7 +1,7 @@
 {
   "name": "douyin-recorder",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "抖音直播录屏 - 类 Olived 的直播录制工具",
   "scripts": {

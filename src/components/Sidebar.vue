@@ -4,6 +4,9 @@ import Icon from './Icon.vue'
 const props = defineProps<{ view: string }>()
 const emit = defineEmits<{ (e: 'update:view', v: string): void }>()
 
+/** 与 package.json / tauri.conf.json 保持一致，方便用户确认装的是哪个版本 */
+const version = '0.2.0'
+
 const items = [
   { key: 'dashboard', label: '仪表盘', icon: 'dashboard' },
   { key: 'rooms', label: '房间管理', icon: 'rooms' },
@@ -45,11 +48,12 @@ const items = [
       </button>
     </nav>
 
-    <div class="px-4 py-4 border-t border-ink-100 text-xs text-ink-400">
+    <div class="px-4 py-4 border-t border-ink-100 text-xs text-ink-400 space-y-1">
       <div class="flex items-center gap-2">
         <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
         后台常驻运行中
       </div>
+      <div class="pl-4 font-mono text-[10px] text-ink-300">v{{ version }}</div>
     </div>
   </aside>
 </template>

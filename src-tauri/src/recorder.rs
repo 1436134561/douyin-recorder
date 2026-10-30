@@ -1,5 +1,6 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,7 +26,18 @@ pub struct RecordingSession {
     pub process: Option<std::process::Child>,
     #[allow(dead_code)]
     pub started_at: i64,
+    /// 下一个分片序号（自动重连时续号，避免覆盖已有分片）
+    #[allow(dead_code)]
+    pub seg_next: u32,
+    /// 已自动重连次数
+    pub retries: u32,
+    /// ffmpeg stderr 落盘位置（不用管道，避免管道写满把录制阻塞住）
+    #[allow(dead_code)]
+    pub log_path: PathBuf,
 }
+
+/// 单次录制最多自动重连次数
+pub const MAX_RECONNECT: u32 = 5;
 
 fn now_ts() -> i64 {
     SystemTime::now()
@@ -151,9 +163,9 @@ pub fn begin_recording<R: Runtime>(
 
 /// 后台看护线程：每 5 秒检查 ffmpeg 是否还活着 + work_dir 文件是否在增长
 ///
-/// 故障检测：
-/// - ffmpeg 子进程死亡 → 尝试保存部分分片 + 发 `recording_failed` 事件
-/// - work_dir 文件 180 秒无增长（说明流已停止推送数据）→ 同样处理
+/// 故障处理顺序（这是「录屏十几兆就不录了」的核心修复）：
+/// 1. 检测到 ffmpeg 退出 / 180 秒无增长 → **先自动重连**（重新解析流地址，续写同一工作目录）
+/// 2. 重连次数用尽（MAX_RECONNECT）才落盘已录内容并报告失败
 ///
 /// 看护线程会一直运行直到本房间的 session 被移除（用户停止 / 检测器停 / 自动清理）
 fn spawn_recording_watcher<R: Runtime>(
@@ -172,7 +184,7 @@ fn spawn_recording_watcher<R: Runtime>(
             std::thread::sleep(std::time::Duration::from_secs(5));
 
             // 1. 本房间是否还在录制？快速锁定以调用 try_wait
-            let (still_recording, work_dir_opt, child_alive) = {
+            let (still_recording, work_dir_opt, child_alive, mode, retries) = {
                 let mut st = state.lock().unwrap();
                 match st.recordings.get_mut(&room_id) {
                     Some(session) => {
@@ -180,9 +192,15 @@ fn spawn_recording_watcher<R: Runtime>(
                             Some(c) => c.try_wait().ok().map(|s| s.is_none()).unwrap_or(false),
                             None => false,
                         };
-                        (true, Some(session.work_dir.clone()), alive)
+                        (
+                            true,
+                            Some(session.work_dir.clone()),
+                            alive,
+                            session.mode.clone(),
+                            session.retries,
+                        )
                     }
-                    None => (false, None, false),
+                    None => (false, None, false, String::new(), 0),
                 }
             };
 
@@ -190,54 +208,210 @@ fn spawn_recording_watcher<R: Runtime>(
                 break;
             }
 
-            // 2. ffmpeg 进程已退出？
-            if !child_alive {
-                finalize_partial_or_cleanup(
-                    &room_id,
-                    "录制进程已退出（可能：流地址失效、主播下播、网络断开）",
-                    &app,
-                    &state,
-                );
-                break;
-            }
-
-            // 3. work_dir 文件大小 + 最近一次增长时间
+            // 2. 视频分片增长情况（只统计视频文件，日志文件增长不算「还在录」）
             let total = work_dir_opt
                 .as_deref()
-                .and_then(|d| std::fs::read_dir(d).ok())
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len()))
-                        .sum::<u64>()
-                })
+                .map(video_bytes_in)
                 .unwrap_or(0);
 
             if total > last_total_bytes {
                 last_total_bytes = total;
                 last_growth = std::time::Instant::now();
-            } else if total == 0 {
-                // 启动后 NO_DATA_TIMEOUT 秒内没数据就算早期失效
-                if last_growth.elapsed() > NO_DATA_TIMEOUT {
-                    finalize_partial_or_cleanup(
-                        &room_id,
-                        "录制启动后 90 秒内未收到任何数据（流地址可能无效）",
-                        &app,
-                        &state,
-                    );
-                    break;
-                }
-            } else if last_growth.elapsed() > STALE_TIMEOUT {
-                finalize_partial_or_cleanup(
-                    &room_id,
-                    "录制文件 180 秒无增长（流可能已中断）；部分数据已尝试保留",
-                    &app,
-                    &state,
-                );
-                break;
             }
+
+            let no_data = total == 0 && last_growth.elapsed() > NO_DATA_TIMEOUT;
+            let stalled = total > 0 && last_growth.elapsed() > STALE_TIMEOUT;
+            if child_alive && !no_data && !stalled {
+                continue;
+            }
+
+            let reason = if !child_alive {
+                "录制进程已退出（流地址失效 / 网络断开 / 主播下播）"
+            } else if no_data {
+                "录制启动后 90 秒内未收到任何数据（流地址可能无效）"
+            } else {
+                "录制文件 180 秒无增长（流已中断）"
+            };
+
+            // 3. 流模式优先自动重连，而不是直接放弃
+            if mode == "stream" && retries < MAX_RECONNECT {
+                let _ = app.emit(
+                    "recording_reconnecting",
+                    json!({
+                        "room_id": room_id,
+                        "attempt": retries + 1,
+                        "max": MAX_RECONNECT,
+                        "reason": reason,
+                    }),
+                );
+                match reconnect_recording(&room_id, &app, &state) {
+                    Ok(()) => {
+                        eprintln!("[recorder] {} 第 {} 次重连成功，继续录制", room_id, retries + 1);
+                        last_total_bytes = 0;
+                        last_growth = std::time::Instant::now();
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[recorder] {} 第 {} 次重连失败: {}", room_id, retries + 1, e);
+                    }
+                }
+            }
+
+            // 4. 重连无望 → 保存已录内容并报告失败
+            finalize_partial_or_cleanup(&room_id, reason, &app, &state);
+            break;
         }
     });
+}
+
+/// 自动重连：重启 ffmpeg，续写同一个工作目录（分片序号接着编，不覆盖已录分片）
+///
+/// 抖音 FLV 地址时效通常只有几分钟，直接让 ffmpeg `-reconnect` 重试旧地址是无效的，
+/// 必须重新解析出新的流地址再拉起进程。
+fn reconnect_recording<R: Runtime>(
+    room_id: &str,
+    app: &AppHandle<R>,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<()> {
+    // 1. 杀掉旧进程，取出工作目录 / 续号 / 重试计数
+    let (cfg, work, seg_start, retries) = {
+        let mut st = state.lock().unwrap();
+        let cfg = st.config.clone();
+        let session = st
+            .recordings
+            .get_mut(room_id)
+            .ok_or_else(|| anyhow!("录制会话已不存在"))?;
+        if let Some(mut c) = session.process.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let next = next_segment_index(&session.work_dir);
+        (
+            cfg,
+            session.work_dir.clone(),
+            next,
+            session.retries + 1,
+        )
+    };
+
+    // 2. 重新解析流地址
+    let page = format!("https://live.douyin.com/{}", room_id);
+    let flv = resolve_flv_blocking(&page).map_err(|e| anyhow!("重新解析流地址失败: {}", e))?;
+
+    // 3. 回写房间配置，下次手动录制直接可用
+    {
+        let mut st = state.lock().unwrap();
+        if let Some(r) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
+            r.stream_url = Some(flv.clone());
+        }
+        let _ = crate::config::save_config(&st.config);
+    }
+
+    // 4. 拉新 ffmpeg（同一工作目录 + 分片续号）
+    let session = spawn_ffmpeg(
+        room_id,
+        &cfg,
+        "stream",
+        Some(flv.as_str()),
+        &work,
+        seg_start,
+        retries,
+    )?;
+
+    // 5. 装回 state（期间用户可能已停止录制 → 必须收掉刚起的进程，别留孤儿）
+    let mut st = state.lock().unwrap();
+    match st.recordings.get_mut(room_id) {
+        Some(slot) => {
+            *slot = session;
+        }
+        None => {
+            let mut orphan = session;
+            if let Some(mut c) = orphan.process.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            return Err(anyhow!("录制已被用户停止"));
+        }
+    }
+    drop(st);
+
+    let _ = app.emit(
+        "recording_reconnected",
+        json!({ "room_id": room_id, "attempt": retries }),
+    );
+    Ok(())
+}
+
+/// 在普通线程里同步解析直播流地址
+///
+/// 看护线程是 std::thread，没有 tokio 上下文，不能直接用 tauri::async_runtime::block_on
+/// （可能 panic / 依赖调用线程）。这里自建一个专用 runtime，创建一次后复用。
+fn resolve_flv_blocking(page: &str) -> Result<String> {
+    use once_cell::sync::Lazy;
+    static RT: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("stream-resolver")
+            .build()
+            .expect("create stream resolver runtime")
+    });
+    let resolved = RT.block_on(crate::stream_resolver::resolve(page))?;
+    Ok(resolved.flv)
+}
+
+/// 统计目录内视频文件总字节数（不含日志/临时文件）
+fn video_bytes_in(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let ext = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(ext.as_str(), "flv" | "mp4" | "ts" | "mkv") {
+                if let Ok(m) = std::fs::metadata(&p) {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+/// 解析 `seg_00012.flv` 的分片序号
+fn seg_number(p: &Path) -> u32 {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("seg_"))
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// 计算下一个可用的分片序号（max + 1）
+fn next_segment_index(dir: &Path) -> u32 {
+    let mut max = 0u32;
+    let mut found = false;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "flv").unwrap_or(false) {
+                let n = seg_number(&p);
+                if !found || n > max {
+                    max = n;
+                    found = true;
+                }
+            }
+        }
+    }
+    if found {
+        max.saturating_add(1)
+    } else {
+        0
+    }
 }
 
 /// 看护触发时调用：先尝试用 stop_and_finalize 保存部分分片（不丢数据），
@@ -283,173 +457,196 @@ fn finalize_partial_or_cleanup<R: Runtime>(
     );
 }
 
-/// 启动 ffmpeg 录制子进程
+/// 启动 ffmpeg 录制子进程（新会话：创建独立工作目录，分片从 0 开始）
 fn start_ffmpeg(
     room_id: &str,
     cfg: &AppConfig,
     room: Option<&RoomConfig>,
 ) -> Result<RecordingSession> {
     std::fs::create_dir_all(&cfg.output_dir)?;
-    let work = cfg.output_dir.join(format!("._work_{}", sanitize_room_id(room_id)));
+    // 关键修复：每次会话用独立工作目录。
+    // 旧实现固定用 `._work_<room>`，上一次失败的残留分片（含 merged.flv）
+    // 会被下一次 `stop_and_finalize` 的 gather_segments 一起合并进去 → 视频内容重复。
+    let work = cfg
+        .output_dir
+        .join(format!("._work_{}@{}", sanitize_room_id(room_id), now_ts()));
     std::fs::create_dir_all(&work)?;
 
     let mode = decide_mode(cfg, room);
+    let url = if mode == "stream" {
+        Some(
+            room.and_then(|r| r.stream_url.clone())
+                .or_else(|| resolve_stream_url(room_id))
+                .ok_or_else(|| anyhow!("房间 {} 未配置直播流地址", room_id))?,
+        )
+    } else {
+        None
+    };
+
+    spawn_ffmpeg(room_id, cfg, mode, url.as_deref(), &work, 0, 0)
+}
+
+/// 在指定工作目录里拉起 ffmpeg（供首次启动与自动重连复用）
+///
+/// `seg_start`：分片起始序号（重连时续号）
+/// `retries`：已重连次数（写回 session 供看护线程判断额度）
+fn spawn_ffmpeg(
+    room_id: &str,
+    cfg: &AppConfig,
+    mode: &str,
+    url: Option<&str>,
+    work: &Path,
+    seg_start: u32,
+    retries: u32,
+) -> Result<RecordingSession> {
     let ffmpeg_bin = ffmpeg_executable();
     // 关键修复：把 child 工作目录设为 ffmpeg.exe 所在目录。
     // mingw 编译的 ffmpeg（gyan.dev essentials / BtbN nightly）依赖同目录的
     // gnuwin32 runtime DLL。如果 spawn 时 cwd 不在 ffmpeg 同目录，
     // DLL 加载阶段就异常退出（exit code 0xABAFB008 这种异常值，stderr 只有 banner）。
-    // 用户实测：cmd 里 cd 到 ffmpeg 同目录手动跑 -version 完全正常，
-    // 但应用 spawn 后立即崩——100% 是这个 working dir 问题。
-    let ffmpeg_dir = std::path::Path::new(&ffmpeg_bin)
+    let ffmpeg_dir = Path::new(&ffmpeg_bin)
         .parent()
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+        .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut child = if mode == "stream" {
-        let url = room
-            .and_then(|r| r.stream_url.clone())
-            .or_else(|| resolve_stream_url(room_id))
-            .ok_or_else(|| anyhow!("房间 {} 未配置直播流地址", room_id))?;
-        let seg_time = cfg.segment_minutes.max(1) * 60;
-        let out_tmpl = work.join("seg_%03d.flv");
-        let mut cmd = Command::new(&ffmpeg_bin);
-        cmd.current_dir(&ffmpeg_dir)
-            .args([
-            "-y",
-            "-v", "info",  // 详细日志：能看到 HTTP 403/网络错误等真实失败原因
-            "-i",
-            &url,
-            "-c",
-            "copy",
-            "-f",
-            "segment",
-            "-segment_time",
-            &seg_time.to_string(),
-            "-segment_format",
-            "flv",
-            "-reset_timestamps",
-            "1",
-            "-vsync",
-            "0",
+    // 关键修复：stderr 不再用管道。
+    // 旧实现 `Cmd::stderr(Stdio::piped())` 后 5 秒就 drop 掉读端，而 ffmpeg 用
+    // `-v info` 每 0.5 秒写一行进度；管道缓冲（约 4KB）写满后 ffmpeg 会**阻塞在写日志上**，
+    // 编码随之停住 —— 表现就是「录了十几兆就不动了」。
+    // 现在把 stderr 直接重定向到日志文件，永远不会阻塞，还能用来定位失败原因。
+    let log_path = work.join("ffmpeg.log");
+    let log_file = File::create(&log_path)
+        .map_err(|e| anyhow!("创建 ffmpeg 日志失败（{}）: {}", log_path.display(), e))?;
+
+    let mut cmd = Command::new(&ffmpeg_bin);
+    cmd.current_dir(&ffmpeg_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log_file))
+        .arg("-y")
+        .args(["-hide_banner", "-v", "info"]);
+
+    if mode == "stream" {
+        let url = url.ok_or_else(|| anyhow!("房间 {} 缺少直播流地址", room_id))?;
+        let seg_time = (cfg.segment_minutes.max(1) * 60).to_string();
+        let seg_start_s = seg_start.to_string();
+        let out_tmpl = work.join("seg_%05d.flv");
+        // ↓↓ 断流重连参数必须放在 -i 之前，否则 ffmpeg 会当成输出选项直接忽略
+        //    （这正是「十几兆就不录了」的元凶：旧代码把它们写在了 -i 之后）
+        cmd.args([
+            "-rw_timeout",
+            "15000000", // 读超时 15s：卡死能主动报错而不是无限挂住
             "-reconnect",
             "1",
             "-reconnect_streamed",
             "1",
+            "-reconnect_at_eof",
+            "1", // CDN 主动 EOF 也要重连（直播流常见）
             "-reconnect_delay_max",
-            "5",
-            &out_tmpl.to_string_lossy(),
+            "10",
         ])
-        .stderr(std::process::Stdio::piped());
-        spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 录制启动失败: {}", e))?
+        .arg("-i")
+        .arg(url)
+        .args(["-c", "copy", "-f", "segment", "-segment_time"])
+        .arg(seg_time)
+        .args(["-segment_format", "flv", "-reset_timestamps", "1"])
+        .arg("-segment_start_number")
+        .arg(seg_start_s)
+        .arg(out_tmpl.as_os_str());
     } else {
         let src = cfg.screen_source.clone().unwrap_or_else(|| "desktop".into());
         let out_file = work.join("rec.mp4");
-        let mut cmd = Command::new(&ffmpeg_bin);
-        cmd.current_dir(&ffmpeg_dir)
+        cmd.args(["-f", "gdigrab", "-framerate", "30"])
+            .arg("-i")
+            .arg(&src)
             .args([
-            "-y",
-            "-v", "info",
-            "-f",
-            "gdigrab",
-            "-framerate",
-            "30",
-            "-i",
-            &src,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "mp4",
-            &out_file.to_string_lossy(),
-        ])
-        .stderr(std::process::Stdio::piped());
-        spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 屏幕录制启动失败: {}", e))?
-    };
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "mp4",
+            ])
+            .arg(out_file.as_os_str());
+    }
 
-    // 关键修复：不用后台线程 + Arc<Mutex>，避免竞态。
-    // 直接 take stderr 句柄保留；等 ffmpeg 退出后同步排空（管道已关闭，read_to_end 立即返回）
-    let stderr_handle: Option<std::process::ChildStderr> = child.stderr.take();
+    let mut child = spawn_hidden(&mut cmd).map_err(|e| anyhow!("ffmpeg 录制启动失败: {}", e))?;
 
-    // 启动后等待 ffmpeg 连接流（流地址解析/握手可能慢；2 秒比之前 0.6 秒更宽裕）
+    // 启动后等待 ffmpeg 连接流（流地址解析/握手可能慢）
     std::thread::sleep(std::time::Duration::from_millis(2000));
     if let Ok(Some(status)) = child.try_wait() {
         if !status.success() {
-            // 同步排空 stderr（管道已随进程退出而关闭，read_to_end 立即返回所有数据）
-            let stderr = drain_stderr(stderr_handle);
-            return Err(ffmpeg_exit_error(&stderr, status.code(), 2, mode));
+            let log = tail_log(&log_path, 1500);
+            return Err(ffmpeg_exit_error(&log, status.code(), 2, mode));
         }
     }
 
-    // 再等 3 秒检查：ffmpeg 进程是活着的，且 seg_000.flv 有没有开始收到数据？
-    // 若 3 秒后 seg_000.flv 仍是 0 字节 → 流地址大概率已过期（抖音 URL 时效性 ~几分钟）
+    // 再等 3 秒检查分片是否开始增长（流地址过期时 ffmpeg 活着但收不到数据）
     std::thread::sleep(std::time::Duration::from_millis(3000));
-    let seg_file = work.join("seg_000.flv");
-    let has_data = seg_file
-        .metadata()
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
+    let has_data = video_bytes_in(work) > 0;
     if !has_data {
         if let Ok(Some(status)) = child.try_wait() {
             if !status.success() {
-                let stderr = drain_stderr(stderr_handle);
-                return Err(ffmpeg_exit_error(&stderr, status.code(), 5, mode));
+                let log = tail_log(&log_path, 1500);
+                return Err(ffmpeg_exit_error(&log, status.code(), 5, mode));
             }
         }
-        let stderr = drain_stderr(stderr_handle);
+        let log = tail_log(&log_path, 1500);
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(anyhow!(
-            "开始录制 {} 秒后仍未收到数据。\n\
+            "开始录制 5 秒后仍未收到数据。\n\
              可能原因：\n\
              ① 流地址已过期（抖音 FLV 地址时效性 ~几分钟，下次会自动重新解析）\n\
              ② 直播间未在直播或被封禁\n\
              ③ 网络防火墙 / 代理问题\n\
              \n\
              请确认直播间正在直播，并重新开始录制。\n\
-             \nffmpeg stderr 尾部：\n{}",
-            5,
-            stderr
+             \nffmpeg 日志尾部：\n{}",
+            log
         ));
     }
-
-    // 一切正常：丢弃 stderr 句柄，让 child 句柄继续持有（后续杀进程会清理）
-    drop(stderr_handle);
 
     Ok(RecordingSession {
         room_id: room_id.to_string(),
         mode: mode.to_string(),
-        work_dir: work,
+        work_dir: work.to_path_buf(),
         process: Some(child),
         started_at: now_ts(),
+        seg_next: seg_start,
+        retries,
+        log_path,
     })
 }
 
-/// 同步排空 ffmpeg stderr（管道随子进程退出已关闭，read_to_end 立即返回所有数据）
-/// 避免后台线程 + Arc<Mutex> 的竞态：之前 read_stderr 可能在后台线程读完前调用，
-/// 导致只能看到 banner 而看不到真正的错误信息。
-fn drain_stderr(stderr: Option<std::process::ChildStderr>) -> String {
-    use std::io::Read;
-    let mut s = match stderr {
-        Some(s) => s,
-        None => return String::from("（stderr 未捕获）"),
+/// 读取日志文件尾部（供错误提示使用）
+///
+/// 取代旧的 `drain_stderr`：stderr 已改落盘，不再有管道排空/竞态问题。
+fn tail_log(path: &Path, max_chars: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return String::from("（无 ffmpeg 日志）"),
     };
-    let mut buf = Vec::with_capacity(2048);
-    match (&mut s).take(8 * 1024).read_to_end(&mut buf) {
-        Ok(_) => {}
-        Err(_) => {
-            // 退路：best-effort
-            let _ = s.read_to_end(&mut buf);
-        }
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(16 * 1024);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return String::from("（读取 ffmpeg 日志失败）");
     }
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
     if buf.is_empty() {
-        return String::from("（stderr 无输出，可能 ffmpeg 被外部进程强制终止，如杀毒软件）");
+        return String::from("（日志为空，可能 ffmpeg 被外力终止，如杀毒软件）");
     }
-    String::from_utf8_lossy(&buf)
-        .chars()
-        .take(1500) // 略放宽，可见更多上下文
-        .collect()
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    let n = s.chars().count();
+    if n > max_chars {
+        s.chars().skip(n - max_chars).collect()
+    } else {
+        s
+    }
 }
 
 /// 生成 ffmpeg 退出错误（包含十六进制退出码 + stderr 尾部 + 分类提示）
@@ -475,7 +672,8 @@ fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &s
         || (c > 0 && (c as u32 & 0xFFFF0000) == 0xC0000000);
     let empty_stderr = stderr.is_empty()
         || stderr.contains("stderr 无输出")
-        || stderr.contains("stderr 未捕获");
+        || stderr.contains("stderr 未捕获")
+        || stderr.contains("日志为空");
 
     // 分类提示（按优先级：abnormal_code > empty_stderr > 关键词）
     // 关键：异常退出码（0xABxxxxxx 或 0xC000000x）单独就触发"疑似杀毒"提示
@@ -524,22 +722,31 @@ fn ffmpeg_exit_error(stderr: &str, code: Option<i32>, waited_secs: u64, mode: &s
 }
 
 /// 收集有效分片文件（阈值 1KB：排除 0 字节空壳文件，保留任何有内容的数据）
+///
+/// 只收 `seg_*.flv`（流模式）/ `rec.mp4`（屏幕模式）：
+/// 旧实现把工作目录下所有 .flv 都收进来，会误把 `merged.flv`（上次合并产物）
+/// 也当成分片合并一遍 → 导出视频内容重复。
 fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if session.mode == "stream" {
         if let Ok(entries) = std::fs::read_dir(&session.work_dir) {
             for e in entries.flatten() {
                 let p = e.path();
-                if p.extension().map(|x| x == "flv").unwrap_or(false) {
-                    if let Ok(meta) = std::fs::metadata(&p) {
-                        if meta.len() > 1_024 {
-                            files.push(p);
-                        }
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !name.starts_with("seg_") || !name.ends_with(".flv") {
+                    continue;
+                }
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    if meta.len() > 1_024 {
+                        files.push(p);
                     }
                 }
             }
         }
-        files.sort();
+        files.sort_by_key(|p| seg_number(p));
     } else {
         let f = session.work_dir.join("rec.mp4");
         if f.exists() {
@@ -551,6 +758,97 @@ fn gather_segments(session: &RecordingSession) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// 列出工作目录里的视频分片（供「等待中」恢复使用，不依赖 RecordingSession）
+pub fn list_work_dir_segments(work_dir: &Path) -> Vec<PathBuf> {
+    let mut segs: Vec<PathBuf> = Vec::new();
+    let mut mp4: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(work_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            let ok_size = std::fs::metadata(&p).map(|m| m.len() > 1_024).unwrap_or(false);
+            if !ok_size || !p.is_file() {
+                continue;
+            }
+            if name.starts_with("seg_") && name.ends_with(".flv") {
+                segs.push(p);
+            } else if name == "rec.mp4" {
+                mp4.push(p);
+            }
+        }
+    }
+    if segs.is_empty() {
+        segs = mp4;
+    }
+    segs.sort_by_key(|p| seg_number(p));
+    segs
+}
+
+/// 把一个残留工作目录收尾成正式录像（合并 → 转码 → 落盘 → 清理工作目录）
+///
+/// 供「等待中」页面手动恢复调用。`room_label` 用于文件名（主播名或房间号）。
+pub fn finalize_work_dir(
+    work_dir: &Path,
+    room_label: &str,
+    cfg: &AppConfig,
+    created_ts: i64,
+) -> Result<RecordingInfo> {
+    let files = list_work_dir_segments(work_dir);
+    if files.is_empty() {
+        return Err(anyhow!(
+            "该工作目录里没有有效分片（目录：{}）",
+            work_dir.display()
+        ));
+    }
+    let merged = work_dir.join("merged.flv");
+    if files.len() > 1 {
+        transcode::merge_segments(&files, &merged)?;
+    } else if let Some(f) = files.first() {
+        std::fs::copy(f, &merged)?;
+    }
+    let merged_len = std::fs::metadata(&merged).map(|m| m.len()).unwrap_or(0);
+    if merged_len == 0 {
+        return Err(anyhow!("合并后无有效数据（原始分片仍在：{}）", work_dir.display()));
+    }
+
+    let effective_fmt = if cfg.auto_mp4 { "mp4" } else { cfg.output_format.as_str() };
+    let ts = if created_ts > 0 { created_ts } else { now_ts() };
+    let name = format!(
+        "{}_{}.{}",
+        sanitize_room_id(room_label),
+        fmt_ts(ts),
+        effective_fmt
+    );
+    let out_path = cfg.output_dir.join(&name);
+    transcode::transcode(&merged, &out_path, effective_fmt).map_err(|e| {
+        anyhow!(
+            "转码失败: {}（原始分片保留在 {}）",
+            e,
+            work_dir.display()
+        )
+    })?;
+
+    // 成功才清理工作目录
+    let _ = std::fs::remove_dir_all(work_dir);
+
+    let mut id = name.clone();
+    if let Some(stripped) = id.strip_suffix(&format!(".{}", effective_fmt)) {
+        id = stripped.to_string();
+    }
+    Ok(RecordingInfo {
+        id,
+        room_id: room_label.to_string(),
+        path: out_path.to_string_lossy().into(),
+        size_bytes: std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0),
+        duration_sec: 0.0,
+        format: effective_fmt.to_string(),
+        created_at: ts,
+    })
 }
 
 /// 计算最终输出文件名（主播名_时间戳.扩展名）

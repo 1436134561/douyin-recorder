@@ -25,6 +25,8 @@ export const useStore = defineStore('app', () => {
   let toastTimer: number | undefined
   // 状态轻量轮询：覆盖 detector 死亡、stop_and_finalize 同步阻塞期间前端 statuses 陈旧等场景
   let statusPollTimer: number | undefined
+  // 自动重连提示去重（room_id:attempt）
+  const reconnectNotified = new Set<string>()
 
   // 全局确认对话框状态（替代浏览器原生 confirm）
   const confirmDialog = ref<{
@@ -116,6 +118,15 @@ export const useStore = defineStore('app', () => {
       refreshRecordings()
       refreshPending()
       notify('err', `录制已自动停止（${e.room_id}）：${e.reason}`)
+    })
+    api.on('recording_reconnecting', (p) => {
+      // 断流后软件自动重连：只提示一次，避免连续重连刷屏（按 room+attempt 去重）
+      const e = p as { room_id: string; attempt: number; max: number; reason?: string }
+      const key = `${e.room_id}:${e.attempt}`
+      if (reconnectNotified.has(key)) return
+      reconnectNotified.add(key)
+      notify('ok', `检测到断流，正在自动重连（${e.attempt}/${e.max}）…`)
+      refreshStatuses()
     })
     api.on('detection_event', (p) => {
       const e = p as DetectionEvent
@@ -340,6 +351,18 @@ export const useStore = defineStore('app', () => {
     })
   }
 
+  /** 恢复「等待中」录制为正式录像（合并分片 + 转码） */
+  async function resumePending(workDir: string) {
+    await guarded(
+      '恢复录像',
+      async () => {
+        await api.resumePendingRecording(workDir)
+        await Promise.all([refreshPending(), refreshRecordings()])
+      },
+      '已恢复为正式录像',
+    )
+  }
+
   return {
     config,
     rooms,
@@ -373,6 +396,7 @@ export const useStore = defineStore('app', () => {
     resolveRoomUrl,
     deleteRecording,
     cleanupPending,
+    resumePending,
     confirm,
     closeConfirm,
     notify,

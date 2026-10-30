@@ -497,7 +497,15 @@ pub fn delete_recording(path: String, state: State<SharedState>) -> Result<(), S
 /// 列出「等待中」的录制（转码失败残留的 work_dir，可手动恢复/清理）
 #[tauri::command]
 pub fn list_pending_recordings(state: State<SharedState>) -> Vec<crate::types::PendingRecording> {
-    let cfg = state.lock().unwrap().config.clone();
+    let (cfg, active_dirs): (AppConfig, Vec<PathBuf>) = {
+        let st = state.lock().unwrap();
+        let dirs = st
+            .recordings
+            .values()
+            .map(|s| s.work_dir.clone())
+            .collect::<Vec<_>>();
+        (st.config.clone(), dirs)
+    };
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&cfg.output_dir) {
         for e in entries.flatten() {
@@ -507,6 +515,27 @@ pub fn list_pending_recordings(state: State<SharedState>) -> Vec<crate::types::P
                 None => continue,
             };
             if !name.starts_with("._work_") {
+                continue;
+            }
+            // 正在录制的会话目录不算「等待中」（否则用户点恢复会把正在写的分片搬走）
+            if active_dirs.iter().any(|d| d == &p) {
+                continue;
+            }
+            // 跳过没有产生任何有效分片的目录（刚创建就失败的，无恢复价值）
+            let has_video = std::fs::read_dir(&p)
+                .map(|subs| {
+                    subs.flatten().any(|s| {
+                        let sp = s.path();
+                        let ext_ok = sp
+                            .extension()
+                            .map(|x| x == "flv" || x == "mp4")
+                            .unwrap_or(false);
+                        ext_ok
+                            && std::fs::metadata(&sp).map(|m| m.len() > 10_240).unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if !has_video {
                 continue;
             }
             // 扫描 work_dir 内的 flv/mp4 分片
@@ -542,8 +571,10 @@ pub fn list_pending_recordings(state: State<SharedState>) -> Vec<crate::types::P
             if segments.is_empty() {
                 continue;
             }
-            // 从工作目录名解析房间 ID（去掉前缀 `._work_`）
-            let room_id = name.trim_start_matches("._work_").to_string();
+            // 从工作目录名解析房间 ID
+            // 目录名格式：`._work_<room>@<timestamp>`（新）/ `._work_<room>`（旧残留）
+            let tail = name.trim_start_matches("._work_");
+            let room_id = tail.split('@').next().unwrap_or(tail).to_string();
             out.push(crate::types::PendingRecording {
                 work_dir: p.to_string_lossy().into(),
                 segment_count: segments.len() as u32,
@@ -553,7 +584,74 @@ pub fn list_pending_recordings(state: State<SharedState>) -> Vec<crate::types::P
             });
         }
     }
+    // 最近残留排前面
+    out.sort_by(|a, b| b.earliest_ts.cmp(&a.earliest_ts));
     out
+}
+
+/// 恢复「等待中」的残留录制：合并分片 → 转码为正式录像 → 清理工作目录
+///
+/// 这是「等待中」标签页以前只能清理、不能救回数据的修复点。
+#[tauri::command]
+pub async fn resume_pending_recording(
+    work_dir: String,
+    state: State<'_, SharedState>,
+) -> Result<RecordingInfo, String> {
+    let cfg = state.lock().unwrap().config.clone();
+    let p = PathBuf::from(&work_dir);
+
+    // 安全检查：必须在 output_dir 下，且是本应用的残留工作目录
+    let out_dir = std::fs::canonicalize(&cfg.output_dir).unwrap_or_else(|_| cfg.output_dir.clone());
+    let target = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+    if !target.starts_with(&out_dir) {
+        return Err("安全限制：只能恢复 output_dir 下的残留".into());
+    }
+    let dir_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !dir_name.starts_with("._work_") {
+        return Err("目标不是录制残留工作目录".into());
+    }
+    if !target.exists() {
+        return Err("工作目录不存在（可能已被清理）".into());
+    }
+
+    // 文件名用主播名（房间配置里的 name），没有就用房间号
+    let room_id = dir_name
+        .trim_start_matches("._work_")
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let label = cfg
+        .rooms
+        .iter()
+        .find(|r| r.id == room_id)
+        .and_then(|r| r.name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| room_id.clone());
+
+    // 用最早分片的修改时间做文件名时间戳，更贴近真实录制时间
+    let created_ts = crate::recorder::list_work_dir_segments(&target)
+        .first()
+        .and_then(|f| std::fs::metadata(f).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+    let cfg_clone = cfg.clone();
+    let work = target.clone();
+    let label_clone = label.clone();
+    // 合并 + 转码是重活，扔到阻塞线程池，别卡住 WebView
+    let res = tokio::task::spawn_blocking(move || {
+        crate::recorder::finalize_work_dir(&work, &label_clone, &cfg_clone, created_ts)
+    })
+    .await
+    .map_err(|e| format!("join error: {}", e))?;
+
+    res.map_err(|e| e.to_string())
 }
 
 /// 清理「等待中」录制的工作目录（删除残留分片）

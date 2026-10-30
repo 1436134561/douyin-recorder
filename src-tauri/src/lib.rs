@@ -90,6 +90,7 @@ pub fn run() {
             commands::delete_recording,
             commands::list_pending_recordings,
             commands::cleanup_pending_recording,
+            commands::resume_pending_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

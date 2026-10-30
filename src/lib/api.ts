@@ -46,6 +46,9 @@ export const api = {
   /** 清理「等待中」录制的工作目录 */
   cleanupPendingRecording: (workDir: string) =>
     invoke<void>('cleanup_pending_recording', { workDir }),
+  /** 恢复「等待中」录制：合并分片 + 转码为正式录像 */
+  resumePendingRecording: (workDir: string) =>
+    invoke<RecordingInfo>('resume_pending_recording', { workDir }),
   on: (event: string, cb: (payload: unknown) => void): Promise<UnlistenFn> =>
     listen(event, (e) => cb(e.payload)),
 }
