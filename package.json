@@ -4,6 +4,9 @@
   "version": "0.2.0",
   "type": "module",
   "description": "抖音直播录屏 - 类 Olived 的直播录制工具",
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "vue-demi"]
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
