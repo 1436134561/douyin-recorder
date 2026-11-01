@@ -323,12 +323,66 @@ pub fn get_autostart(app: AppHandle) -> bool {
     autostart::is_autostart_enabled(&app)
 }
 
-/// 强制显示主窗口（从任何状态恢复：hidden + minimized → 稳定可见 + 获焦）
+/// 强制显示主窗口（从任何状态恢复：hidden / minimized / 尺寸异常 → 可见 + 获焦 + 重新合成）
+///
+/// **白屏根因**：窗口最小化或被 `hide()` 之后，WebView2 的 DirectComposition 目标停止出帧；
+/// 而原来的实现只有 `unminimize + show + set_focus`，这三步**不产生任何尺寸变化**，
+/// WebView2 收不到 `WM_SIZE` 就不会重建合成表面 —— 于是 HWND 显示了、内容却是空白（白屏），
+/// 同时输入路由也没恢复，表现就是「所有按钮都点不动」。
+/// 修复：恢复时主动制造一次肉眼不可见的尺寸抖动，逼 WebView2 重新 layout + 合成。
 pub fn show_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
+        // 极端情况窗口可能被缩成 0×0（DPI 切换 / 某些最小化路径），先纠正到可用尺寸
+        restore_sane_size(&w);
         let _ = w.set_focus();
+        nudge_repaint(w);
+    }
+}
+
+/// 窗口尺寸异常（0 或过小）时纠正回可用尺寸，避免 WebView2 无法分配渲染表面
+fn restore_sane_size<R: Runtime>(w: &tauri::WebviewWindow<R>) {
+    const MIN_W: u32 = 640;
+    const MIN_H: u32 = 480;
+    let Ok(sz) = w.outer_size() else { return };
+    if sz.width >= MIN_W && sz.height >= MIN_H {
+        return;
+    }
+    let nw = if sz.width < MIN_W { 1200 } else { sz.width };
+    let nh = if sz.height < MIN_H { 800 } else { sz.height };
+    let _ = w.set_size(tauri::PhysicalSize::new(nw, nh));
+}
+
+/// 强制重绘：制造一次 1px 的尺寸抖动（最大化时跳过，否则会退出最大化），
+/// 并让页面再抛一次 resize 事件。
+///
+/// 必须放到后台线程执行：如果调用方在主线程（托盘菜单 / setup），
+/// 在主线程 sleep 会阻塞消息泵，两次 `set_size` 会被合并、抖动失效。
+fn nudge_repaint<R: Runtime>(w: tauri::WebviewWindow<R>) {
+    std::thread::spawn(move || {
+        let maximized = w.is_maximized().unwrap_or(false);
+        if !maximized {
+            if let Ok(sz) = w.outer_size() {
+                if sz.width >= 200 && sz.height >= 200 {
+                    let _ = w.set_size(tauri::PhysicalSize::new(sz.width, sz.height + 1));
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    let _ = w.set_size(tauri::PhysicalSize::new(sz.width, sz.height));
+                }
+            }
+        }
+        // 通知前端「窗口已恢复」，让前端窗口守卫做一次自检（它才是兜底的那一层）
+        let _ = w.eval("window.dispatchEvent(new Event('wb:window-restored'))");
+    });
+}
+
+/// 前端兜底用：任务栏还原等路径不经过 `show_window`，由前端自检发现渲染停摆后主动调用
+#[tauri::command]
+pub fn force_repaint_window(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        nudge_repaint(w);
     }
 }
 

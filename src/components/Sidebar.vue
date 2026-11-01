@@ -5,7 +5,7 @@ const props = defineProps<{ view: string }>()
 const emit = defineEmits<{ (e: 'update:view', v: string): void }>()
 
 /** 与 package.json / tauri.conf.json 保持一致，方便用户确认装的是哪个版本 */
-const version = '0.2.0'
+const version = '0.2.1'
 
 const items = [
   { key: 'dashboard', label: '仪表盘', icon: 'dashboard' },

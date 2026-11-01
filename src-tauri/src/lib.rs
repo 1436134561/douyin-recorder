@@ -84,6 +84,7 @@ pub fn run() {
             commands::set_autostart,
             commands::get_autostart,
             commands::show_main,
+            commands::force_repaint_window,
             commands::hide_main,
             commands::get_status,
             commands::resolve_room_url,

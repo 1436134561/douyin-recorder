@@ -26,7 +26,13 @@ const current = computed(() => {
   }
 })
 
-onMounted(() => store.init())
+onMounted(() => {
+  store.init()
+  // 窗口守卫自愈成功后给用户一次可见反馈（正常情况下不会触发）
+  window.addEventListener('wb:render-healed', () => {
+    store.notify('ok', '窗口渲染已自动恢复')
+  })
+})
 </script>
 
 <template>

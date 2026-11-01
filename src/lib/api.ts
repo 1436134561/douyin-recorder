@@ -33,6 +33,8 @@ export const api = {
   setAutostart: (enable: boolean) => invoke<void>('set_autostart', { enable }),
   getAutostart: () => invoke<boolean>('get_autostart'),
   showMain: () => invoke<void>('show_main'),
+  /** 窗口恢复后强制 WebView2 重绘（修复最小化/隐藏后白屏） */
+  forceRepaintWindow: () => invoke<void>('force_repaint_window'),
   hideMain: () => invoke<void>('hide_main'),
   getStatus: (roomId: string) =>
     invoke<RoomStatus>('get_status', { roomId }),
