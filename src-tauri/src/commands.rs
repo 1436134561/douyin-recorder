@@ -476,6 +476,13 @@ async fn do_resolve_and_save(
         }
     };
     let mut st = state.lock().unwrap();
+    // 明确记录本次选中的画质档位，便于确认「分辨率没有被降级」
+    eprintln!(
+        "[resolver] 房间 {} 选用画质 = {}（{}）",
+        room_id,
+        resolved.quality,
+        crate::stream_resolver::quality_hint(&resolved.quality)
+    );
     // 如果房间名是空的，且解析拿到了主播昵称 → 填充，并尝试重命名已有文件
     if let Some(room) = st.config.rooms.iter_mut().find(|r| r.id == room_id) {
         room.stream_url = Some(resolved.flv);
@@ -512,6 +519,8 @@ pub async fn resolve_room_url(url: String) -> Result<serde_json::Value, String> 
                 "success": true,
                 "flv": resolved.flv,
                 "hls": resolved.hls,
+                // 实际选中的清晰度档位（如 FULL_HD1 / HD1 / ORIGIN），便于确认没有被降级
+                "quality": resolved.quality,
             });
             // 附加元数据（主播名、房间标题）
             if let Some(meta) = resolved.meta {

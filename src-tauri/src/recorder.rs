@@ -34,6 +34,9 @@ pub struct RecordingSession {
     /// ffmpeg stderr 落盘位置（不用管道，避免管道写满把录制阻塞住）
     #[allow(dead_code)]
     pub log_path: PathBuf,
+    /// 本次录制实际输出的分辨率（从 ffmpeg 日志解析，如 `1080x1920`）
+    /// 用于确认没有被降级 —— 前端会展示，也方便用户自查
+    pub resolution: Option<String>,
 }
 
 /// 单次录制最多自动重连次数
@@ -124,6 +127,10 @@ pub fn begin_recording<R: Runtime>(
     }
 
     let session = start_ffmpeg(room_id, &cfg, room.as_ref())?;
+    let resolution = session.resolution.clone();
+    if let Some(ref r) = resolution {
+        eprintln!("[recorder] 实际录制分辨率 = {}", r);
+    }
     state
         .lock()
         .unwrap()
@@ -157,7 +164,10 @@ pub fn begin_recording<R: Runtime>(
         }
     }
 
-    let _ = app.emit("recording_started", serde_json::json!({ "room_id": room_id }));
+    let _ = app.emit(
+        "recording_started",
+        json!({ "room_id": room_id, "resolution": resolution }),
+    );
     Ok(())
 }
 
@@ -319,6 +329,7 @@ fn reconnect_recording<R: Runtime>(
     )?;
 
     // 5. 装回 state（期间用户可能已停止录制 → 必须收掉刚起的进程，别留孤儿）
+    let resolution = session.resolution.clone();
     let mut st = state.lock().unwrap();
     match st.recordings.get_mut(room_id) {
         Some(slot) => {
@@ -337,7 +348,7 @@ fn reconnect_recording<R: Runtime>(
 
     let _ = app.emit(
         "recording_reconnected",
-        json!({ "room_id": room_id, "attempt": retries }),
+        json!({ "room_id": room_id, "attempt": retries, "resolution": resolution }),
     );
     Ok(())
 }
@@ -357,6 +368,11 @@ fn resolve_flv_blocking(page: &str) -> Result<String> {
             .expect("create stream resolver runtime")
     });
     let resolved = RT.block_on(crate::stream_resolver::resolve(page))?;
+    eprintln!(
+        "[recorder] 重连解析画质 = {}（{}）",
+        resolved.quality,
+        crate::stream_resolver::quality_hint(&resolved.quality)
+    );
     Ok(resolved.flv)
 }
 
@@ -617,6 +633,7 @@ fn spawn_ffmpeg(
         started_at: now_ts(),
         seg_next: seg_start,
         retries,
+        resolution: parse_resolution_from_log(&log_path),
         log_path,
     })
 }
@@ -647,6 +664,56 @@ fn tail_log(path: &Path, max_chars: usize) -> String {
     } else {
         s
     }
+}
+
+/// 从 ffmpeg 日志里解析实际输出的分辨率（`Stream #0:0: Video: h264 ..., 1080x1920, ...`）
+///
+/// 为什么不用 ffprobe：发行包里只 sidecar 了 ffmpeg.exe，没有 ffprobe。
+/// 而 `-c copy` 模式下 ffmpeg 会把输入流的真实分辨率打印到 stderr（现已落盘到 ffmpeg.log），
+/// 直接解析这段日志即可拿到**实际**录制分辨率 —— 这正好可以用来验证没有被降级。
+fn parse_resolution_from_log(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = File::open(path).ok()?;
+    let mut s = String::new();
+    f.read_to_string(&mut s).ok()?;
+
+    for line in s.lines() {
+        let Some(idx) = line.find("Video:") else {
+            continue;
+        };
+        // 只在 "Video:" 之后找第一处 NNNxNNN，避开 SAR/DAR 等无关数字
+        let tail: Vec<char> = line[idx..].chars().collect();
+        let mut i = 0;
+        while i < tail.len() {
+            if !tail[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let ws = i;
+            let mut j = i;
+            while j < tail.len() && tail[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < tail.len() && tail[j] == 'x' {
+                let mut k = j + 1;
+                while k < tail.len() && tail[k].is_ascii_digit() {
+                    k += 1;
+                }
+                let w: String = tail[ws..j].iter().collect();
+                let h: String = tail[j + 1..k].iter().collect();
+                // 合理分辨率范围，防止把 `5x5` 之类的时长/参数当成分辨率
+                let valid = (2..=5).contains(&w.len())
+                    && (2..=5).contains(&h.len())
+                    && w.parse::<u32>().unwrap_or(0) >= 16
+                    && h.parse::<u32>().unwrap_or(0) >= 16;
+                if valid {
+                    return Some(format!("{}x{}", w, h));
+                }
+            }
+            i = j.max(i + 1);
+        }
+    }
+    None
 }
 
 /// 生成 ffmpeg 退出错误（包含十六进制退出码 + stderr 尾部 + 分类提示）

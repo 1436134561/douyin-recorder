@@ -19,8 +19,10 @@ use std::collections::HashMap;
 /// 解析结果（含流地址 + 房间元数据）
 #[derive(Debug, Clone)]
 pub struct ResolvedStream {
-    /// 最佳 FLV 流地址（优先原画 OR4，其次 HD）
+    /// 最佳 FLV 流地址（按清晰度打分取最高可用档）
     pub flv: String,
+    /// 选中档位的名称（如 `ORIGIN` / `FULL_HD1` / `HD1`），用于日志与排查
+    pub quality: String,
     /// HLS (m3u8) 地址（可选）
     pub hls: Option<String>,
     /// 房间元数据（主播昵称、房间标题等）
@@ -35,9 +37,6 @@ pub struct RoomMeta {
     /// 房间标题
     pub title: String,
 }
-
-/// 画质优先级（从高到低）
-const QUALITY_ORDER: &[&str] = &["OR4", "UHD", "HD", "SD", "LD"];
 
 /// 判断输入是否已经是流地址（flv/hls/m3u8 结尾或含 pull/douyincdn）
 pub fn is_stream_url(url: &str) -> bool {
@@ -502,37 +501,134 @@ fn recursive_find_streams(
     }
 }
 
-/// 从 HashMap 中按画质优先级选择最佳 FLV URL
-fn best_flv(urls: &HashMap<String, String>) -> Option<String> {
-    for q in QUALITY_ORDER {
-        let key = format!("flv:{}", q);
-        if let Some(url) = urls.get(&key) {
-            return Some(url.clone());
-        }
+/// 画质打分（分数越高画质越好）
+///
+/// **不能用精确 key 匹配**：抖音不同接口返回的清晰度 key 命名并不统一 ——
+///   · `webcast/room/web/enter` → `FULL_HD1` / `HD1` / `SD1` / `SD2`
+///   · 页面 RENDER_DATA          → `OR4` / `HD` / `SD`
+///   · `live_core_sdk_data`      → `origin` / `hd` / `sd1` / `sd2`
+/// 旧实现只认 `OR4/UHD/HD/SD/LD`，遇到 `FULL_HD1/HD1/SD1/SD2` 一个都匹配不上，
+/// 于是落到「任意 flv」的兜底分支，而 HashMap 遍历顺序是随机的 →
+/// 经常随机选中 `SD1`（540×960）甚至 `SD2`，这就是分辨率被降级的直接原因。
+///
+/// 这里改成按语义关键词打分，命名变形也能正确排序。
+fn quality_score(name: &str) -> i32 {
+    let n = name.to_ascii_lowercase().replace(['-', ' ', '.'], "_");
+    // 原画
+    if n.contains("origin") || n.contains("orig") || n == "or4" || n == "or" {
+        return 100;
     }
-    // 兜底：任意 flv
+    // 全高清 / 超清
+    if n.contains("full_hd")
+        || n.contains("fullhd")
+        || n.contains("uhd")
+        || n.contains("4k")
+        || n.contains("2k")
+    {
+        return 90;
+    }
+    if n.contains("hd") {
+        return 80;
+    }
+    if n.contains("md") {
+        return 70;
+    }
+    // 低清（必须先判 sd2/ld，再判 sd1，最后才是泛 sd）
+    if n.contains("sd2") || n.contains("ld") || n.contains("low") {
+        return 40;
+    }
+    if n.contains("sd1") {
+        return 60;
+    }
+    if n.contains("sd") {
+        return 55;
+    }
+    // 未知档位：给一个高于标清的分数（宁可高不要低），并把名字打出来方便排查
+    65
+}
+
+/// 从 URL 本身推断清晰度（抖音 FLV/HLS 的 path 一般带 `or4` / `hd` / `sd1` 这类前缀）
+///
+/// 这是对 `quality_score(key)` 的交叉校验：即使抖音某天改了 key 命名，
+/// 只要 URL 主干保留清晰度标识，仍能选对档位。返回 0 表示 URL 里看不出信息。
+fn score_from_url(url: &str) -> i32 {
+    let u = url.to_ascii_lowercase();
+    if u.contains("/or4") || u.contains("origin") || u.contains("/or.") {
+        return 100;
+    }
+    if u.contains("full_hd") || u.contains("fullhd") || u.contains("uhd") {
+        return 90;
+    }
+    if u.contains("/hd") || u.contains("_hd") || u.contains("-hd") {
+        return 80;
+    }
+    if u.contains("sd2") || u.contains("_ld") || u.contains("/ld") {
+        return 40;
+    }
+    if u.contains("sd1") {
+        return 60;
+    }
+    if u.contains("/sd") || u.contains("_sd") {
+        return 55;
+    }
+    0
+}
+
+/// 把档位名翻译成便于阅读的说明（仅用于日志/排错）
+pub fn quality_hint(name: &str) -> &'static str {
+    match quality_score(name) {
+        100 => "原画",
+        90 => "全高清/超清",
+        80 => "高清",
+        70 => "标清+",
+        65 => "未知档位（按较高档处理）",
+        60 => "标清",
+        55 => "标清（泛 sd）",
+        _ => "低清",
+    }
+}
+
+/// 选出画质最高的 FLV：返回 (档位名, 地址)
+fn pick_best_flv(urls: &HashMap<String, String>) -> Option<(String, String)> {
+    let mut cands: Vec<(i32, String, String)> = Vec::new();
     for (k, v) in urls {
-        if k.starts_with("flv:") {
-            return Some(v.clone());
-        }
+        let Some(name) = k.strip_prefix("flv:") else {
+            continue;
+        };
+        // key 打分与 URL 打分取较大值
+        let score = quality_score(name).max(score_from_url(v));
+        cands.push((score, name.to_string(), v.clone()));
     }
-    None
+    if cands.is_empty() {
+        return None;
+    }
+    // 分数降序；同分按档位名降序，保证结果是**确定**的（旧实现是 HashMap 随机顺序）
+    cands.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let (score, name, url) = cands[0].clone();
+    eprintln!(
+        "[resolver] 选中画质 {}（score={}），候选: {:?}",
+        name,
+        score,
+        cands
+            .iter()
+            .map(|(s, n, _)| format!("{}:{}", n, s))
+            .collect::<Vec<_>>()
+    );
+    Some((name, url))
 }
 
 /// 从 HashMap 中选择最佳 HLS URL
 fn best_hls(urls: &HashMap<String, String>) -> Option<String> {
-    for q in QUALITY_ORDER {
-        let key = format!("hls:{}", q);
-        if let Some(url) = urls.get(&key) {
-            return Some(url.clone());
-        }
-    }
+    let mut cands: Vec<(i32, String, String)> = Vec::new();
     for (k, v) in urls {
-        if k.starts_with("hls:") {
-            return Some(v.clone());
-        }
+        let Some(name) = k.strip_prefix("hls:") else {
+            continue;
+        };
+        let score = quality_score(name).max(score_from_url(v));
+        cands.push((score, name.to_string(), v.clone()));
     }
-    None
+    cands.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    cands.into_iter().next().map(|(_, _, url)| url)
 }
 
 /// 公开接口：解析用户输入为真实流地址 + 元数据
@@ -548,12 +644,13 @@ pub async fn resolve(input: &str) -> Result<ResolvedStream> {
         return Err(anyhow!("输入不能为空"));
     }
 
-    // 如果已经是流地址，直接返回
+    // 如果已经是流地址，直接返回（画质由 URL 自身决定，不做任何降级）
     if is_stream_url(input) {
         return Ok(ResolvedStream {
             flv: input.to_string(),
             hls: None,
             meta: None,
+            quality: format!("direct(score={})", score_from_url(input)),
         });
     }
 
@@ -566,11 +663,12 @@ pub async fn resolve(input: &str) -> Result<ResolvedStream> {
     // 方案 1: Webcast API
     match fetch_webcast_api(&web_rid, &client).await {
         Ok((urls, meta)) => {
-            if let Some(flv) = best_flv(&urls) {
+            if let Some((quality, flv)) = pick_best_flv(&urls) {
                 return Ok(ResolvedStream {
                     flv,
                     hls: best_hls(&urls),
                     meta,
+                    quality,
                 });
             }
             attempts.push(("Webcast API".into(), "未返回流地址".into()));
@@ -583,11 +681,12 @@ pub async fn resolve(input: &str) -> Result<ResolvedStream> {
     // 方案 2: 页面 HTML RENDER_DATA（备选）
     match fetch_page_render_data(&web_rid, &client).await {
         Ok((urls, meta)) => {
-            if let Some(flv) = best_flv(&urls) {
+            if let Some((quality, flv)) = pick_best_flv(&urls) {
                 return Ok(ResolvedStream {
                     flv,
                     hls: best_hls(&urls),
                     meta,
+                    quality,
                 });
             }
             attempts.push(("页面 RENDER_DATA".into(), "未返回流地址".into()));
@@ -807,7 +906,52 @@ mod tests {
         urls.insert("flv:OR4".into(), "or4.flv".into());
         urls.insert("flv:HD".into(), "hd.flv".into());
 
-        assert_eq!(best_flv(&urls), Some("or4.flv".into()));
+        assert_eq!(
+            pick_best_flv(&urls).map(|(_, url)| url),
+            Some("or4.flv".into())
+        );
+    }
+
+    /// 回归测试：`webcast/room/web/enter` 用的是 FULL_HD1/HD1/SD1/SD2 命名。
+    /// 旧实现只认 OR4/UHD/HD/SD/LD，一个都匹配不上 → 落到「任意 flv」兜底分支，
+    /// 而 HashMap 遍历顺序随机，经常选中 SD1（540×960）→ 录出来的分辨率被降级。
+    #[test]
+    fn test_best_flv_full_hd_naming() {
+        let mut urls = HashMap::new();
+        urls.insert("flv:SD1".into(), "https://x.com/live/sd1.flv".into());
+        urls.insert("flv:SD2".into(), "https://x.com/live/sd2.flv".into());
+        urls.insert("flv:HD1".into(), "https://x.com/live/hd1.flv".into());
+        urls.insert(
+            "flv:FULL_HD1".into(),
+            "https://x.com/live/full_hd1.flv".into(),
+        );
+
+        // 反复跑 50 次，确认结果稳定（不受 HashMap 随机顺序影响）
+        for _ in 0..50 {
+            let (name, url) = pick_best_flv(&urls).unwrap();
+            assert_eq!(name, "FULL_HD1");
+            assert_eq!(url, "https://x.com/live/full_hd1.flv");
+        }
+    }
+
+    /// 原画（origin / OR4）优先级高于全高清
+    #[test]
+    fn test_quality_score_order() {
+        assert!(quality_score("origin") > quality_score("FULL_HD1"));
+        assert!(quality_score("OR4") > quality_score("FULL_HD1"));
+        assert!(quality_score("FULL_HD1") > quality_score("HD1"));
+        assert!(quality_score("HD1") > quality_score("SD1"));
+        assert!(quality_score("SD1") > quality_score("SD2"));
+        assert!(quality_score("SD2") < quality_score("SD"));
+    }
+
+    /// URL 里带清晰度标识时，即使 key 命名未知也能选对
+    #[test]
+    fn test_pick_best_flv_by_url() {
+        let mut urls = HashMap::new();
+        urls.insert("flv:unknown_a".into(), "https://x.com/live/sd1.flv".into());
+        urls.insert("flv:unknown_b".into(), "https://x.com/live/or4.flv".into());
+        assert_eq!(pick_best_flv(&urls).unwrap().0, "unknown_b");
     }
 
     #[test]

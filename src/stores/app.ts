@@ -103,8 +103,11 @@ export const useStore = defineStore('app', () => {
     await refreshRecordings()
     await refreshPending()
     await refreshStatuses()
-    api.on('recording_started', () => {
+    api.on('recording_started', (p) => {
       refreshStatuses()
+      // 显示后端解析出的真实录制分辨率，方便确认画质没有被降级
+      const e = p as { room_id: string; resolution?: string | null }
+      if (e.resolution) notify('ok', `开始录制 · ${e.resolution}`)
     })
     api.on('recording_stopped', () => {
       refreshRecordings()
